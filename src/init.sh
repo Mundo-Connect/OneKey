@@ -271,7 +271,7 @@ parse_protocol_transport() {
     value="${value//＋/+}"
     if [ -z "$value" ]; then
         protocol_part="mx"
-        transport_part="mc1"
+        transport_part="mundordp"
     elif [[ "$value" == *+* ]]; then
         protocol_part="${value%%+*}"
         transport_part="${value#*+}"
@@ -348,6 +348,13 @@ ech_capable_transport() {
     esac
 }
 
+cdn_capable_transport() {
+    case "$1" in
+        mc1|xhttp|websocket) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 default_port_for_transport() {
     case "$1" in
         mundordp) echo "3389" ;;
@@ -356,13 +363,48 @@ default_port_for_transport() {
 }
 
 choose_protocol_transport() {
-    say "输入协议+传输（回车使用 mx+mc1）:"
-    say "  mx+mc1 / mx+mundordp / mx+xhttp / mx+grpc / mx+ws"
-    say "  trojan+mc1 / vless+mc1 / vmess+mc1 / anytls+mc1"
-    say "  trojan+mundordp / vless+mundordp / vmess+mundordp / anytls+mundordp"
+    say "输入协议+传输（回车使用 mx+mundordp）:"
+    say "协议:"
+    say "  mx (Mundo X)"
+    say "  trojan (Trojan)"
+    say "  vless (VLESS)"
+    say "  vmess (VMess)"
+    say "  anytls (AnyTLS)"
+    say "传输:"
+    say "  ${green}mundordp (Mundo Connect RDP Protocol，所有协议支持)${none}"
+    say "  ${green}mc1 (Mundo Connect 1，所有协议支持，CDN)${none}"
+    say "  xhttp (XHTTP，仅 mx，CDN)"
+    say "  grpc (gRPC，仅 mx)"
+    say "  ws (WebSocket，仅 mx，CDN)"
     local choice
-    read -r -p "协议+传输 [mx+mc1]: " choice
+    read -r -p "协议+传输 [mx+mundordp]: " choice
     parse_protocol_transport "$choice" || err "不支持的协议或传输。"
+}
+
+choose_server_host() {
+    local value
+    read -r -p "域名或服务器IP地址 [apple.com]: " value
+    value="$(sanitize_host "$value")"
+    if [ -z "$value" ]; then
+        SERVER_HOST="apple.com"
+        SERVER_HOST_DEFAULTED=1
+    else
+        SERVER_HOST="$value"
+        SERVER_HOST_DEFAULTED=0
+    fi
+}
+
+choose_cdn_address() {
+    local transport="$1"
+    local default_host="$2"
+    CLIENT_HOST="$default_host"
+    CDN_ENABLED=0
+    if cdn_capable_transport "$transport" && yes_no_default_no "使用 CDN 优选地址"; then
+        CLIENT_HOST="$(prompt_default "CDN 优选地址" "$default_host")"
+        CLIENT_HOST="$(sanitize_host "$CLIENT_HOST")"
+        [ -n "$CLIENT_HOST" ] || CLIENT_HOST="$default_host"
+        CDN_ENABLED=1
+    fi
 }
 
 ensure_dirs() {
@@ -425,6 +467,20 @@ prepare_certificate() {
 
 render_tls_settings() {
     local host="$1"
+    if is_ip_address "$host"; then
+        cat <<EOF
+    "security": "tls",
+    "tlsSettings": {
+      "certificates": [
+        {
+          "certificateFile": "$CERT_FILE",
+          "keyFile": "$KEY_FILE"
+        }
+      ]
+    }
+EOF
+        return 0
+    fi
     cat <<EOF
     "security": "tls",
     "tlsSettings": {
@@ -449,7 +505,13 @@ render_stream_settings() {
     local service_name
     local mc1_mode="auto"
     local mc1_disable_h3="false"
+    local host_line=""
+    local authority_line=""
     service_name="$(service_name_for_path "$path")"
+    if ! is_ip_address "$host"; then
+        host_line="\"host\": \"$host\","
+        authority_line="\"authority\": \"$host\","
+    fi
     if [ "$reverse_proxy" = "1" ] && [ "$transport" = "mc1" ]; then
         mc1_mode="h2"
         mc1_disable_h3="true"
@@ -462,8 +524,8 @@ render_stream_settings() {
     "network": "mc1",
 $(render_tls_settings "$host"),
     "mc1Settings": {
-      "host": "$host",
       "path": "$path",
+      $host_line
       "mode": "$mc1_mode",
       "disableH3Upload": $mc1_disable_h3
     }
@@ -489,8 +551,8 @@ EOF
     "network": "xhttp",
 $(render_tls_settings "$host"),
     "xhttpSettings": {
-      "host": "$host",
       "path": "$path",
+      $host_line
       "mode": "auto"
     }
   }
@@ -502,8 +564,8 @@ EOF
     "network": "grpc",
 $(render_tls_settings "$host"),
     "grpcSettings": {
-      "authority": "$host",
       "serviceName": "$service_name",
+      $authority_line
       "multiMode": true,
       "idle_timeout": 0,
       "health_check_timeout": 0,
@@ -519,8 +581,9 @@ EOF
     "network": "websocket",
 $(render_tls_settings "$host"),
     "wsSettings": {
-      "host": "$host",
       "path": "$path"
+      ${host_line:+,}
+      ${host_line%,}
     }
   }
 EOF
@@ -653,13 +716,15 @@ write_profile() {
     local port="$3"
     local token="$4"
     local host="$5"
-    local path="$6"
-    local username="$7"
-    local connections="$8"
-    local ech_mode="$9"
-    local reverse_proxy="${10}"
-    local external_port="${11}"
-    local core_port="${12}"
+    local client_host="$6"
+    local path="$7"
+    local username="$8"
+    local connections="$9"
+    local ech_mode="${10}"
+    local reverse_proxy="${11}"
+    local external_port="${12}"
+    local core_port="${13}"
+    local cdn_enabled="${14:-0}"
     cat > "$PROFILE_FILE" <<EOF
 PROTOCOL='$protocol'
 TRANSPORT='$transport'
@@ -667,11 +732,13 @@ PORT='$external_port'
 CORE_PORT='$core_port'
 TOKEN='$token'
 HOST='$host'
+CLIENT_HOST='$client_host'
 PATH_VALUE='$path'
 RDP_USERNAME='$username'
 RDP_CONNECTIONS='$connections'
 ECH_MODE='$ech_mode'
 REVERSE_PROXY='$reverse_proxy'
+CDN_ENABLED='$cdn_enabled'
 EOF
     chmod 600 "$PROFILE_FILE"
 }
@@ -681,11 +748,12 @@ build_client_uri() {
     local transport="$2"
     local port="$3"
     local token="$4"
-    local host="$5"
-    local path="$6"
-    local username="$7"
-    local ech_mode="$8"
-    local reverse_proxy="${9:-0}"
+    local connect_host="$5"
+    local server_host="$6"
+    local path="$7"
+    local username="$8"
+    local ech_mode="$9"
+    local reverse_proxy="${10:-0}"
     local uri_type
     uri_type="$(uri_transport_name "$transport")"
     local mc1_mode="auto"
@@ -693,16 +761,30 @@ build_client_uri() {
         mc1_mode="h2"
     fi
 
-    local query="security=tls&type=$(url_encode "$uri_type")&sni=$(url_encode "$host")&fp=chrome&encryption=none"
+    local query="security=tls&type=$(url_encode "$uri_type")&fp=chrome&encryption=none"
+    if ! is_ip_address "$server_host"; then
+        query="$query&sni=$(url_encode "$server_host")"
+    fi
     case "$transport" in
         mc1)
-            query="$query&path=$(url_encode "$path")&host=$(url_encode "$host")&mode=$(url_encode "$mc1_mode")"
+            query="$query&path=$(url_encode "$path")"
+            if ! is_ip_address "$server_host"; then
+                query="$query&host=$(url_encode "$server_host")"
+            fi
+            query="$query&mode=$(url_encode "$mc1_mode")"
             ;;
         xhttp)
-            query="$query&path=$(url_encode "$path")&host=$(url_encode "$host")&mode=auto"
+            query="$query&path=$(url_encode "$path")"
+            if ! is_ip_address "$server_host"; then
+                query="$query&host=$(url_encode "$server_host")"
+            fi
+            query="$query&mode=auto"
             ;;
         websocket)
-            query="$query&path=$(url_encode "$path")&host=$(url_encode "$host")"
+            query="$query&path=$(url_encode "$path")"
+            if ! is_ip_address "$server_host"; then
+                query="$query&host=$(url_encode "$server_host")"
+            fi
             ;;
         grpc)
             query="$query&serviceName=$(url_encode "$(service_name_for_path "$path")")"
@@ -721,7 +803,7 @@ build_client_uri() {
     printf "%s://%s@%s:%s?%s#%s" \
         "$protocol" \
         "$(url_encode "$token")" \
-        "$(uri_authority_host "$host")" \
+        "$(uri_authority_host "$connect_host")" \
         "$port" \
         "$query" \
         "$(url_encode "$(uri_node_name "$protocol" "$transport" "$ech_mode")")"
@@ -732,12 +814,13 @@ write_client_uri() {
     local transport="$2"
     local port="$3"
     local token="$4"
-    local host="$5"
-    local path="$6"
-    local username="$7"
-    local ech_mode="$8"
-    local reverse_proxy="${9:-0}"
-    build_client_uri "$protocol" "$transport" "$port" "$token" "$host" "$path" "$username" "$ech_mode" "$reverse_proxy" > "$CLIENT_URI_FILE"
+    local connect_host="$5"
+    local server_host="$6"
+    local path="$7"
+    local username="$8"
+    local ech_mode="$9"
+    local reverse_proxy="${10:-0}"
+    build_client_uri "$protocol" "$transport" "$port" "$token" "$connect_host" "$server_host" "$path" "$username" "$ech_mode" "$reverse_proxy" > "$CLIENT_URI_FILE"
     chmod 600 "$CLIENT_URI_FILE"
 }
 
@@ -746,14 +829,15 @@ write_client_uris() {
     local transport="$2"
     local port="$3"
     local token="$4"
-    local host="$5"
-    local path="$6"
-    local username="$7"
-    local reverse_proxy="${8:-0}"
-    build_client_uri "$protocol" "$transport" "$port" "$token" "$host" "$path" "$username" "off" "$reverse_proxy" > "$CLIENT_URI_FILE"
+    local connect_host="$5"
+    local server_host="$6"
+    local path="$7"
+    local username="$8"
+    local reverse_proxy="${9:-0}"
+    build_client_uri "$protocol" "$transport" "$port" "$token" "$connect_host" "$server_host" "$path" "$username" "off" "$reverse_proxy" > "$CLIENT_URI_FILE"
     chmod 600 "$CLIENT_URI_FILE"
-    if ech_capable_transport "$protocol" "$transport"; then
-        build_client_uri "$protocol" "$transport" "$port" "$token" "$host" "$path" "$username" "always" "$reverse_proxy" > "$CLIENT_URI_ECH_FILE"
+    if ech_capable_transport "$protocol" "$transport" && ! is_ip_address "$server_host"; then
+        build_client_uri "$protocol" "$transport" "$port" "$token" "$connect_host" "$server_host" "$path" "$username" "always" "$reverse_proxy" > "$CLIENT_URI_ECH_FILE"
         chmod 600 "$CLIENT_URI_ECH_FILE"
     else
         rm -f "$CLIENT_URI_ECH_FILE"
@@ -928,10 +1012,16 @@ configure() {
     [ "$external_port" -ge 1 ] && [ "$external_port" -le 65535 ] || err "端口范围必须是 1-65535。"
 
     local host
-    host="$(prompt_default "服务器地址" "")"
-    host="$(sanitize_host "$host")"
-    [ -n "$host" ] || err "服务器地址不能为空。"
-    prepare_certificate "$host"
+    local client_host
+    choose_server_host
+    host="$SERVER_HOST"
+    if [ "$SERVER_HOST_DEFAULTED" = "1" ]; then
+        generate_self_signed_cert "$host"
+    else
+        prepare_certificate "$host"
+    fi
+    choose_cdn_address "$transport" "$host"
+    client_host="$CLIENT_HOST"
 
     local path="/"
     if [ "$transport" != "mundordp" ]; then
@@ -1003,8 +1093,8 @@ configure() {
     fi
 
     write_config "$protocol" "$transport" "$core_port" "$token" "$host" "$path" "$username" "$connections" "$listen_addr" "$reverse_proxy"
-    write_profile "$protocol" "$transport" "$core_port" "$token" "$host" "$path" "$username" "$connections" "$ech_mode" "$reverse_proxy" "$external_port" "$core_port"
-    write_client_uris "$protocol" "$transport" "$external_port" "$token" "$host" "$path" "$username" "$reverse_proxy"
+    write_profile "$protocol" "$transport" "$core_port" "$token" "$host" "$client_host" "$path" "$username" "$connections" "$ech_mode" "$reverse_proxy" "$external_port" "$core_port" "$CDN_ENABLED"
+    write_client_uris "$protocol" "$transport" "$external_port" "$token" "$client_host" "$host" "$path" "$username" "$reverse_proxy"
     if [ "$reverse_proxy" -eq 1 ]; then
         write_nginx_config "$transport" "$external_port" "$core_port" "$host" "$path"
     else
@@ -1024,6 +1114,7 @@ configure() {
         say "监听: $listen_addr:$core_port"
     fi
     say "服务器: $host"
+    [ "$client_host" != "$host" ] && say "连接地址: $client_host"
     [ "$transport" != "mundordp" ] && say "路径: $path"
     [ "$transport" = "mundordp" ] && say "用户名: $username"
     say "$token_label: $token"
@@ -1146,9 +1237,11 @@ show_info() {
     local port=""
     local core_port=""
     local host=""
+    local client_host=""
     local path_value=""
     local ech_mode=""
     local reverse_proxy=""
+    local cdn_enabled="0"
     local rdp_username=""
     if [ -f "$PROFILE_FILE" ]; then
         # shellcheck disable=SC1090
@@ -1158,9 +1251,11 @@ show_info() {
         port="${PORT:-}"
         core_port="${CORE_PORT:-}"
         host="${HOST:-}"
+        client_host="${CLIENT_HOST:-$host}"
         path_value="${PATH_VALUE:-}"
         ech_mode="${ECH_MODE:-off}"
         reverse_proxy="${REVERSE_PROXY:-0}"
+        cdn_enabled="${CDN_ENABLED:-0}"
         rdp_username="${RDP_USERNAME:-Administrator}"
     fi
 
@@ -1169,6 +1264,7 @@ show_info() {
     [ -n "$transport" ] && say "传输: $(transport_display_name "$transport")"
     [ -n "$port" ] && say "端口: $port"
     [ -n "$host" ] && say "服务器: $host"
+    [ "$cdn_enabled" = "1" ] && [ -n "$client_host" ] && say "连接地址: $client_host"
     [ -n "$path_value" ] && [ "$transport" != "mundordp" ] && say "路径: $path_value"
     [ "$transport" = "mundordp" ] && say "用户名: $rdp_username"
     if [ "$reverse_proxy" = "1" ]; then
@@ -1255,10 +1351,9 @@ menu() {
         say "  2) 重新配置"
         say "  3) 重启"
         say "  4) 状态"
-        say "  5) 开启开机启动 $(autostart_status_label)"
-        say "  6) 关闭开机启动 $(autostart_status_label)"
-        say "  7) 错误日志"
-        say "  8) 卸载"
+        say "  5) 开机启动 $(autostart_status_label)"
+        say "  6) 错误日志"
+        say "  7) 卸载"
         say "  0) 退出"
         local choice
         read -r -p "请选择 [1]: " choice
@@ -1267,10 +1362,15 @@ menu() {
             2) configure ;;
             3) restart_service ;;
             4) status_service ;;
-            5) enable_autostart ;;
-            6) disable_autostart ;;
-            7) show_log "$ERROR_LOG" ;;
-            8) uninstall_mundo_proxy ;;
+            5)
+                if autostart_enabled; then
+                    disable_autostart
+                else
+                    enable_autostart
+                fi
+                ;;
+            6) show_log "$ERROR_LOG" ;;
+            7) uninstall_mundo_proxy ;;
             0) exit 0 ;;
             *) warn "无效选择。" ;;
         esac
