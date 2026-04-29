@@ -12,10 +12,12 @@ LOG_DIR="/var/log/mundoproxy"
 ACCESS_LOG="$LOG_DIR/access.log"
 ERROR_LOG="$LOG_DIR/error.log"
 SERVICE_FILE="/etc/systemd/system/mundoproxy.service"
+OPENRC_SERVICE_FILE="/etc/init.d/mundoproxy"
 COMMAND_BIN="/usr/local/bin/mp"
 CORE_BIN="/usr/local/bin/mundoproxy"
 CORE_BACKUP_BIN="$BIN_DIR/mundoproxy"
 CLIENT_URI_FILE="$APP_DIR/client.uri"
+CLIENT_URI_ECH_FILE="$APP_DIR/client-ech.uri"
 PROFILE_FILE="$APP_DIR/profile.env"
 NGINX_CONF_FILE="/etc/nginx/conf.d/mundoproxy.conf"
 
@@ -37,6 +39,10 @@ require_root() {
 
 systemd_available() {
     command -v systemctl >/dev/null 2>&1
+}
+
+openrc_available() {
+    command -v rc-service >/dev/null 2>&1 && command -v rc-update >/dev/null 2>&1
 }
 
 detect_pkg_manager() {
@@ -77,6 +83,30 @@ install_nginx() {
     command -v nginx >/dev/null 2>&1 || err "Nginx 安装失败。"
 }
 
+install_certbot() {
+    command -v certbot >/dev/null 2>&1 && return 0
+    local manager
+    manager="$(detect_pkg_manager)"
+    [ -n "$manager" ] || return 1
+    warn "安装 certbot。"
+    case "$manager" in
+        apt)
+            apt-get update -y
+            DEBIAN_FRONTEND=noninteractive apt-get install -y certbot
+            ;;
+        dnf)
+            dnf install -y certbot
+            ;;
+        yum)
+            yum install -y certbot
+            ;;
+        apk)
+            apk add --no-cache certbot
+            ;;
+    esac
+    command -v certbot >/dev/null 2>&1
+}
+
 prompt_default() {
     local prompt="$1"
     local default="$2"
@@ -102,6 +132,20 @@ yes_no_default_no() {
 random_hex() {
     local bytes="${1:-16}"
     openssl rand -hex "$bytes"
+}
+
+random_uuid() {
+    if [ -r /proc/sys/kernel/random/uuid ]; then
+        cat /proc/sys/kernel/random/uuid
+        return 0
+    fi
+    local hex
+    hex="$(random_hex 16)"
+    printf "%s-%s-%s-%s-%s" "${hex:0:8}" "${hex:8:4}" "${hex:12:4}" "${hex:16:4}" "${hex:20:12}"
+}
+
+is_uuid() {
+    [[ "$1" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]
 }
 
 random_desktop_name() {
@@ -162,6 +206,29 @@ service_name_for_path() {
     printf "%s" "$value"
 }
 
+normalize_protocol() {
+    case "$(printf "%s" "$1" | tr '[:upper:]' '[:lower:]')" in
+        ""|"mx"|"mundo-x"|"mundo x")
+            echo "mx"
+            ;;
+        "trojan")
+            echo "trojan"
+            ;;
+        "vless")
+            echo "vless"
+            ;;
+        "vmess")
+            echo "vmess"
+            ;;
+        "anytls"|"any-tls")
+            echo "anytls"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
 normalize_transport() {
     case "$(printf "%s" "$1" | tr '[:upper:]' '[:lower:]')" in
         ""|"1"|"mc1"|"mundo-connect-1"|"mundo connect 1")
@@ -185,13 +252,53 @@ normalize_transport() {
     esac
 }
 
+protocol_supports_transport() {
+    local protocol="$1"
+    local transport="$2"
+    if [ "$protocol" = "mx" ]; then
+        return 0
+    fi
+    case "$transport" in
+        mc1|mundordp) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+parse_protocol_transport() {
+    local raw="$1"
+    local value protocol_part transport_part
+    value="$(printf "%s" "$raw" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+    value="${value//＋/+}"
+    if [ -z "$value" ]; then
+        protocol_part="mx"
+        transport_part="mc1"
+    elif [[ "$value" == *+* ]]; then
+        protocol_part="${value%%+*}"
+        transport_part="${value#*+}"
+    elif normalize_transport "$value" >/dev/null 2>&1; then
+        protocol_part="mx"
+        transport_part="$value"
+    elif normalize_protocol "$value" >/dev/null 2>&1; then
+        protocol_part="$value"
+        transport_part="mc1"
+    else
+        return 1
+    fi
+
+    CHOSEN_PROTOCOL="$(normalize_protocol "$protocol_part")" || return 1
+    CHOSEN_TRANSPORT="$(normalize_transport "$transport_part")" || return 1
+    protocol_supports_transport "$CHOSEN_PROTOCOL" "$CHOSEN_TRANSPORT" || {
+        err "只有 mx 支持 ws、grpc、xhttp；$CHOSEN_PROTOCOL 只能使用 mc1 或 mundordp。"
+    }
+}
+
 transport_display_name() {
     case "$1" in
-        mc1) echo "Mundo Connect 1 (mc1)" ;;
-        mundordp) echo "Mundo Connect RDP Protocol (mundordp)" ;;
-        xhttp) echo "XHTTP (xhttp)" ;;
-        grpc) echo "gRPC (grpc)" ;;
-        websocket) echo "WebSocket (websocket)" ;;
+        mc1) echo "mc1" ;;
+        mundordp) echo "mundordp" ;;
+        xhttp) echo "xhttp" ;;
+        grpc) echo "grpc" ;;
+        websocket) echo "ws" ;;
         *) echo "$1" ;;
     esac
 }
@@ -201,6 +308,25 @@ uri_transport_name() {
         websocket) echo "ws" ;;
         *) echo "$1" ;;
     esac
+}
+
+uri_node_name() {
+    local protocol="$1"
+    local transport="$2"
+    local ech_mode="$3"
+    local name
+    case "$transport" in
+        mc1) name="$protocol-mc1" ;;
+        mundordp) name="$protocol-rdp" ;;
+        xhttp) name="$protocol-xhttp" ;;
+        grpc) name="$protocol-grpc" ;;
+        websocket) name="$protocol-ws" ;;
+        *) name="$protocol" ;;
+    esac
+    if [ "$ech_mode" = "always" ]; then
+        name="$name-ech"
+    fi
+    printf "%s" "$name"
 }
 
 uri_authority_host() {
@@ -213,7 +339,10 @@ uri_authority_host() {
 }
 
 ech_capable_transport() {
-    case "$1" in
+    local protocol="$1"
+    local transport="$2"
+    [ "$protocol" = "mx" ] || return 1
+    case "$transport" in
         mc1|xhttp|websocket) return 0 ;;
         *) return 1 ;;
     esac
@@ -226,34 +355,14 @@ default_port_for_transport() {
     esac
 }
 
-choose_transport() {
-    say "请选择传输协议:"
-    say "  1) Mundo Connect 1 (mc1，推荐)"
-    say "  2) Mundo Connect RDP Protocol (mundordp，推荐)"
-    say "  3) XHTTP (xhttp，可过 CDN)"
-    say "  4) gRPC (grpc)"
-    say "  5) WebSocket (websocket，可过 CDN)"
+choose_protocol_transport() {
+    say "输入协议+传输（回车使用 mx+mc1）:"
+    say "  mx+mc1 / mx+mundordp / mx+xhttp / mx+grpc / mx+ws"
+    say "  trojan+mc1 / vless+mc1 / vmess+mc1 / anytls+mc1"
+    say "  trojan+mundordp / vless+mundordp / vmess+mundordp / anytls+mundordp"
     local choice
-    read -r -p "传输协议 [1]: " choice
-    normalize_transport "${choice:-1}" || err "不支持的传输协议。"
-}
-
-choose_ech_mode() {
-    local transport="$1"
-    if ! ech_capable_transport "$transport"; then
-        echo "off"
-        return 0
-    fi
-    say "请选择节点模式:"
-    say "  1) Mundo Connect"
-    say "  2) Mundo Connect + ECH"
-    local choice
-    read -r -p "节点模式 [1]: " choice
-    case "${choice:-1}" in
-        1) echo "off" ;;
-        2) echo "always" ;;
-        *) err "不支持的节点模式。" ;;
-    esac
+    read -r -p "协议+传输 [mx+mc1]: " choice
+    parse_protocol_transport "$choice" || err "不支持的协议或传输。"
 }
 
 ensure_dirs() {
@@ -270,10 +379,10 @@ generate_self_signed_cert() {
     if is_domain_name "$host"; then
         cn="$host"
         san="subjectAltName=DNS:$host"
-        warn "未配置受信任证书，将为域名 $host 生成自签名证书。"
+        warn "将生成自签名证书: $host"
     else
         cn="$(random_desktop_name)"
-        warn "未使用域名或输入的是 IP，将生成随机自签名证书: $cn"
+        warn "将生成自签名证书: $cn"
     fi
 
     rm -f "$CERT_FILE" "$KEY_FILE"
@@ -287,6 +396,31 @@ generate_self_signed_cert() {
             -subj "/CN=$cn" >/dev/null 2>&1 || err "自签名证书生成失败，请确认 openssl 可用。"
     fi
     chmod 600 "$KEY_FILE"
+}
+
+try_certbot_cert() {
+    local host="$1"
+    local live_dir="/etc/letsencrypt/live/$host"
+    install_certbot || return 1
+    certbot certonly --standalone --preferred-challenges http \
+        --non-interactive --agree-tos --register-unsafely-without-email \
+        -d "$host" || return 1
+    [ -s "$live_dir/fullchain.pem" ] && [ -s "$live_dir/privkey.pem" ] || return 1
+    CERT_FILE="$live_dir/fullchain.pem"
+    KEY_FILE="$live_dir/privkey.pem"
+    return 0
+}
+
+prepare_certificate() {
+    local host="$1"
+    if is_domain_name "$host" && yes_no_default_no "使用 certbot 申请证书（需要 80 端口）"; then
+        if try_certbot_cert "$host"; then
+            ok "已使用 certbot 证书。"
+            return 0
+        fi
+        warn "certbot 失败，改用自签名证书。"
+    fi
+    generate_self_signed_cert "$host"
 }
 
 render_tls_settings() {
@@ -395,17 +529,20 @@ EOF
 }
 
 write_config() {
-    local transport="$1"
-    local port="$2"
-    local token="$3"
-    local host="$4"
-    local path="$5"
-    local username="$6"
-    local connections="$7"
-    local listen_addr="$8"
-    local reverse_proxy="$9"
+    local protocol="$1"
+    local transport="$2"
+    local port="$3"
+    local token="$4"
+    local host="$5"
+    local path="$6"
+    local username="$7"
+    local connections="$8"
+    local listen_addr="$9"
+    local reverse_proxy="${10}"
     local stream_settings
+    local inbound_settings
     stream_settings="$(render_stream_settings "$transport" "$host" "$path" "$username" "$connections" "$reverse_proxy")"
+    inbound_settings="$(render_inbound_settings "$protocol" "$token")"
 
     ensure_dirs
     cat > "$CONFIG_FILE" <<EOF
@@ -417,17 +554,11 @@ write_config() {
   },
   "inbounds": [
     {
-      "tag": "mundo-x-$transport",
+      "tag": "$protocol-$transport",
       "listen": "$listen_addr",
       "port": $port,
-      "protocol": "mx",
-      "settings": {
-        "users": [
-          {
-            "token": "$token"
-          }
-        ]
-      },
+      "protocol": "$protocol",
+      "settings": $inbound_settings,
       "streamSettings": $stream_settings,
       "sniffing": {
         "enabled": true,
@@ -452,19 +583,85 @@ write_config() {
 EOF
 }
 
+render_inbound_settings() {
+    local protocol="$1"
+    local token="$2"
+    case "$protocol" in
+        mx)
+            cat <<EOF
+{
+        "users": [
+          {
+            "token": "$token"
+          }
+        ]
+      }
+EOF
+            ;;
+        trojan)
+            cat <<EOF
+{
+        "clients": [
+          {
+            "password": "$token"
+          }
+        ]
+      }
+EOF
+            ;;
+        anytls)
+            cat <<EOF
+{
+        "users": [
+          {
+            "password": "$token"
+          }
+        ]
+      }
+EOF
+            ;;
+        vless)
+            cat <<EOF
+{
+        "clients": [
+          {
+            "id": "$token"
+          }
+        ],
+        "decryption": "none"
+      }
+EOF
+            ;;
+        vmess)
+            cat <<EOF
+{
+        "clients": [
+          {
+            "id": "$token",
+            "security": "auto"
+          }
+        ]
+      }
+EOF
+            ;;
+    esac
+}
+
 write_profile() {
-    local transport="$1"
-    local port="$2"
-    local token="$3"
-    local host="$4"
-    local path="$5"
-    local username="$6"
-    local connections="$7"
-    local ech_mode="$8"
-    local reverse_proxy="$9"
-    local external_port="${10}"
-    local core_port="${11}"
+    local protocol="$1"
+    local transport="$2"
+    local port="$3"
+    local token="$4"
+    local host="$5"
+    local path="$6"
+    local username="$7"
+    local connections="$8"
+    local ech_mode="$9"
+    local reverse_proxy="${10}"
+    local external_port="${11}"
+    local core_port="${12}"
     cat > "$PROFILE_FILE" <<EOF
+PROTOCOL='$protocol'
 TRANSPORT='$transport'
 PORT='$external_port'
 CORE_PORT='$core_port'
@@ -480,14 +677,15 @@ EOF
 }
 
 build_client_uri() {
-    local transport="$1"
-    local port="$2"
-    local token="$3"
-    local host="$4"
-    local path="$5"
-    local username="$6"
-    local ech_mode="$7"
-    local reverse_proxy="${8:-0}"
+    local protocol="$1"
+    local transport="$2"
+    local port="$3"
+    local token="$4"
+    local host="$5"
+    local path="$6"
+    local username="$7"
+    local ech_mode="$8"
+    local reverse_proxy="${9:-0}"
     local uri_type
     uri_type="$(uri_transport_name "$transport")"
     local mc1_mode="auto"
@@ -520,25 +718,46 @@ build_client_uri() {
         query="$query&echMode=off"
     fi
 
-    printf "mx://%s@%s:%s?%s#%s" \
+    printf "%s://%s@%s:%s?%s#%s" \
+        "$protocol" \
         "$(url_encode "$token")" \
         "$(uri_authority_host "$host")" \
         "$port" \
         "$query" \
-        "$(url_encode "Mundo X $(transport_display_name "$transport")")"
+        "$(url_encode "$(uri_node_name "$protocol" "$transport" "$ech_mode")")"
 }
 
 write_client_uri() {
-    local transport="$1"
-    local port="$2"
-    local token="$3"
-    local host="$4"
-    local path="$5"
-    local username="$6"
-    local ech_mode="$7"
-    local reverse_proxy="${8:-0}"
-    build_client_uri "$transport" "$port" "$token" "$host" "$path" "$username" "$ech_mode" "$reverse_proxy" > "$CLIENT_URI_FILE"
+    local protocol="$1"
+    local transport="$2"
+    local port="$3"
+    local token="$4"
+    local host="$5"
+    local path="$6"
+    local username="$7"
+    local ech_mode="$8"
+    local reverse_proxy="${9:-0}"
+    build_client_uri "$protocol" "$transport" "$port" "$token" "$host" "$path" "$username" "$ech_mode" "$reverse_proxy" > "$CLIENT_URI_FILE"
     chmod 600 "$CLIENT_URI_FILE"
+}
+
+write_client_uris() {
+    local protocol="$1"
+    local transport="$2"
+    local port="$3"
+    local token="$4"
+    local host="$5"
+    local path="$6"
+    local username="$7"
+    local reverse_proxy="${8:-0}"
+    build_client_uri "$protocol" "$transport" "$port" "$token" "$host" "$path" "$username" "off" "$reverse_proxy" > "$CLIENT_URI_FILE"
+    chmod 600 "$CLIENT_URI_FILE"
+    if ech_capable_transport "$protocol" "$transport"; then
+        build_client_uri "$protocol" "$transport" "$port" "$token" "$host" "$path" "$username" "always" "$reverse_proxy" > "$CLIENT_URI_ECH_FILE"
+        chmod 600 "$CLIENT_URI_ECH_FILE"
+    else
+        rm -f "$CLIENT_URI_ECH_FILE"
+    fi
 }
 
 nginx_location_path() {
@@ -693,41 +912,65 @@ configure() {
         no_restart=1
     fi
 
-    say "${blue}生成 Mundo Proxy 配置${none}"
-    say "协议固定为 Mundo X (mx)。推荐传输为 Mundo Connect 1 (mc1) 或 Mundo Connect RDP Protocol (mundordp)。"
+    say "${blue}生成配置${none}"
 
+    local protocol
     local transport
-    transport="$(choose_transport)"
-    local ech_mode
-    ech_mode="$(choose_ech_mode "$transport")"
+    choose_protocol_transport
+    protocol="$CHOSEN_PROTOCOL"
+    transport="$CHOSEN_TRANSPORT"
+    local ech_mode="off"
     local default_port
     default_port="$(default_port_for_transport "$transport")"
     local external_port
-    external_port="$(prompt_default "对外端口" "$default_port")"
+    external_port="$(prompt_default "端口" "$default_port")"
     [[ "$external_port" =~ ^[0-9]+$ ]] || err "端口必须是数字。"
     [ "$external_port" -ge 1 ] && [ "$external_port" -le 65535 ] || err "端口范围必须是 1-65535。"
 
     local host
-    host="$(prompt_default "服务器地址（域名或 IP，客户端 URI 会使用这个地址）" "")"
+    host="$(prompt_default "服务器地址" "")"
     host="$(sanitize_host "$host")"
     [ -n "$host" ] || err "服务器地址不能为空。"
+    prepare_certificate "$host"
 
-    local path
-    path="$(prompt_default "HTTP 类传输路径" "/$(random_hex 6)")"
-    path="$(sanitize_path "$path")"
+    local path="/"
+    if [ "$transport" != "mundordp" ]; then
+        path="$(prompt_default "路径" "/$(random_hex 6)")"
+        path="$(sanitize_path "$path")"
+    fi
 
     local token
-    token="$(prompt_default "Mundo X token" "$(random_hex 16)")"
+    local token_label="Token"
+    local token_default
+    case "$protocol" in
+        vless|vmess)
+            token_label="UUID"
+            token_default="$(random_uuid)"
+            ;;
+        trojan|anytls)
+            token_label="Password"
+            token_default="$(random_hex 16)"
+            ;;
+        *)
+            token_default="$(random_hex 16)"
+            ;;
+    esac
+    token="$(prompt_default "$token_label" "$token_default")"
     token="$(printf "%s" "$token" | tr -cd 'A-Za-z0-9._~:/+=-')"
     [ -n "$token" ] || err "token 不能为空。"
+    case "$protocol" in
+        vless|vmess)
+            is_uuid "$token" || err "$protocol 需要 UUID。"
+            ;;
+    esac
 
     local username="Administrator"
     local connections=1
     if [ "$transport" = "mundordp" ]; then
-        username="$(prompt_default "RDP 用户名" "Administrator")"
+        username="$(prompt_default "用户名" "Administrator")"
         username="$(printf "%s" "$username" | tr -cd 'A-Za-z0-9._@-')"
         [ -n "$username" ] || username="Administrator"
-        connections="$(prompt_default "RDP HTTP/2 channel 连接数" "1")"
+        connections="$(prompt_default "连接数" "1")"
         [[ "$connections" =~ ^[0-9]+$ ]] || connections=1
         [ "$connections" -ge 1 ] && [ "$connections" -le 255 ] || connections=1
     fi
@@ -737,11 +980,11 @@ configure() {
     local listen_addr="0.0.0.0"
     if [ "$transport" != "mundordp" ]; then
         if [ "$external_port" != "443" ]; then
-            warn "SSL 对外端口不是 443。"
-            if yes_no_default_no "是否启用 Nginx 反代，让 Nginx 对外监听 $external_port，Mundo Proxy 仅监听 127.0.0.1"; then
+            warn "当前端口不是 443。"
+            if yes_no_default_no "启用 Nginx 反代"; then
                 reverse_proxy=1
             fi
-        elif yes_no_default_no "是否启用 Nginx 反代"; then
+        elif yes_no_default_no "启用 Nginx 反代"; then
             reverse_proxy=1
         fi
     fi
@@ -752,74 +995,136 @@ configure() {
             default_core_port=$((external_port - 10000))
         fi
         [ "$default_core_port" -ge 1 ] || default_core_port=1443
-        core_port="$(prompt_default "Mundo Proxy 内部监听端口" "$default_core_port")"
+        core_port="$(prompt_default "后端端口" "$default_core_port")"
         [[ "$core_port" =~ ^[0-9]+$ ]] || err "内部端口必须是数字。"
         [ "$core_port" -ge 1 ] && [ "$core_port" -le 65535 ] || err "内部端口范围必须是 1-65535。"
         [ "$core_port" != "$external_port" ] || err "反代模式下内部端口不能和对外端口相同。"
         listen_addr="127.0.0.1"
     fi
 
-    generate_self_signed_cert "$host"
-    write_config "$transport" "$core_port" "$token" "$host" "$path" "$username" "$connections" "$listen_addr" "$reverse_proxy"
-    write_profile "$transport" "$core_port" "$token" "$host" "$path" "$username" "$connections" "$ech_mode" "$reverse_proxy" "$external_port" "$core_port"
-    write_client_uri "$transport" "$external_port" "$token" "$host" "$path" "$username" "$ech_mode" "$reverse_proxy"
+    write_config "$protocol" "$transport" "$core_port" "$token" "$host" "$path" "$username" "$connections" "$listen_addr" "$reverse_proxy"
+    write_profile "$protocol" "$transport" "$core_port" "$token" "$host" "$path" "$username" "$connections" "$ech_mode" "$reverse_proxy" "$external_port" "$core_port"
+    write_client_uris "$protocol" "$transport" "$external_port" "$token" "$host" "$path" "$username" "$reverse_proxy"
     if [ "$reverse_proxy" -eq 1 ]; then
         write_nginx_config "$transport" "$external_port" "$core_port" "$host" "$path"
     else
         remove_nginx_config
     fi
 
-    ok "配置已写入: $CONFIG_FILE"
-    ok "客户端 URI 已写入: $CLIENT_URI_FILE"
-    say "协议: Mundo X (mx)"
+    ok "配置已生成"
+    say "配置文件: $CONFIG_FILE"
+    say "普通 URI 文件: $CLIENT_URI_FILE"
+    [ -f "$CLIENT_URI_ECH_FILE" ] && say "ECH URI 文件: $CLIENT_URI_ECH_FILE"
+    say "协议: $protocol"
     say "传输: $(transport_display_name "$transport")"
-    if [ "$ech_mode" = "always" ]; then
-        say "节点模式: Mundo Connect + ECH"
-    else
-        say "节点模式: Mundo Connect"
-    fi
-    say "对外端口: $external_port"
+    say "端口: $external_port"
     if [ "$reverse_proxy" -eq 1 ]; then
         say "反代: Nginx -> 127.0.0.1:$core_port"
-        [ "$transport" = "mc1" ] && say "Mundo Connect 1 反代模式: 已使用 H2 并关闭 H3 上传"
     else
         say "监听: $listen_addr:$core_port"
     fi
-    say "服务器地址/Host/SNI: $host"
+    say "服务器: $host"
     [ "$transport" != "mundordp" ] && say "路径: $path"
     [ "$transport" = "mundordp" ] && say "用户名: $username"
-    say "Token: $token"
-    say "URI: $(cat "$CLIENT_URI_FILE")"
+    say "$token_label: $token"
+    say "普通 URI: $(cat "$CLIENT_URI_FILE")"
+    [ -f "$CLIENT_URI_ECH_FILE" ] && say "ECH URI: $(cat "$CLIENT_URI_ECH_FILE")"
 
     if [ "$no_restart" -eq 0 ] && systemd_available && systemctl list-unit-files mundoproxy.service >/dev/null 2>&1; then
         systemctl restart mundoproxy
+        ok "服务已重启。"
+    elif [ "$no_restart" -eq 0 ] && openrc_available && [ -f "$OPENRC_SERVICE_FILE" ]; then
+        rc-service mundoproxy restart
         ok "服务已重启。"
     fi
 }
 
 start_service() {
     require_root
-    systemd_available || err "当前系统没有 systemctl。"
-    systemctl start mundoproxy
+    if systemd_available; then
+        systemctl start mundoproxy
+    elif openrc_available; then
+        rc-service mundoproxy start
+    else
+        err "未检测到 systemd 或 OpenRC。"
+    fi
 }
 
 stop_service() {
     require_root
-    systemd_available || err "当前系统没有 systemctl。"
-    systemctl stop mundoproxy
+    if systemd_available; then
+        systemctl stop mundoproxy
+    elif openrc_available; then
+        rc-service mundoproxy stop
+    else
+        err "未检测到 systemd 或 OpenRC。"
+    fi
 }
 
 restart_service() {
     require_root
-    systemd_available || err "当前系统没有 systemctl。"
-    systemctl restart mundoproxy
+    if systemd_available; then
+        systemctl restart mundoproxy
+    elif openrc_available; then
+        rc-service mundoproxy restart
+    else
+        err "未检测到 systemd 或 OpenRC。"
+    fi
+}
+
+autostart_enabled() {
+    if systemd_available; then
+        systemctl is-enabled mundoproxy >/dev/null 2>&1
+        return $?
+    fi
+    if openrc_available; then
+        rc-update show default 2>/dev/null | grep -q '^ *mundoproxy'
+        return $?
+    fi
+    return 1
+}
+
+autostart_status_label() {
+    if autostart_enabled; then
+        printf "%b" "${green}[当前已开启]${none}"
+    else
+        printf "%b" "${red}[当前已关闭]${none}"
+    fi
+}
+
+enable_autostart() {
+    require_root
+    if systemd_available; then
+        [ -f "$SERVICE_FILE" ] || err "服务文件不存在: $SERVICE_FILE"
+        systemctl enable mundoproxy >/dev/null
+    elif openrc_available; then
+        [ -f "$OPENRC_SERVICE_FILE" ] || err "服务文件不存在: $OPENRC_SERVICE_FILE"
+        rc-update add mundoproxy default >/dev/null
+    else
+        err "未检测到 systemd 或 OpenRC。"
+    fi
+    ok "开机启动已开启。"
+}
+
+disable_autostart() {
+    require_root
+    if systemd_available; then
+        systemctl disable mundoproxy >/dev/null 2>&1 || true
+    elif openrc_available; then
+        rc-update del mundoproxy default >/dev/null 2>&1 || true
+    else
+        err "未检测到 systemd 或 OpenRC。"
+    fi
+    ok "开机启动已关闭。"
 }
 
 status_service() {
     if systemd_available && systemctl list-unit-files mundoproxy.service >/dev/null 2>&1; then
         systemctl status mundoproxy --no-pager
+    elif openrc_available && [ -f "$OPENRC_SERVICE_FILE" ]; then
+        rc-service mundoproxy status
     else
-        warn "未安装 systemd 服务。"
+        warn "未安装服务。"
         if [ -x "$CORE_BIN" ]; then
             say "可手动运行: mundoproxy run -c $CONFIG_FILE"
         fi
@@ -836,6 +1141,7 @@ show_log() {
 }
 
 show_info() {
+    local protocol="mx"
     local transport=""
     local port=""
     local core_port=""
@@ -847,6 +1153,7 @@ show_info() {
     if [ -f "$PROFILE_FILE" ]; then
         # shellcheck disable=SC1090
         . "$PROFILE_FILE"
+        protocol="${PROTOCOL:-mx}"
         transport="${TRANSPORT:-}"
         port="${PORT:-}"
         core_port="${CORE_PORT:-}"
@@ -858,20 +1165,10 @@ show_info() {
     fi
 
     say "${cyan}Mundo Proxy${none}"
-    say "脚本来源: Mundo Connect 专用本地部署脚本 (GPLv3)"
-    say "GitHub: https://github.com/Mundo-Connect"
-    say "管理命令: mp"
-    [ -n "$transport" ] && say "协议: Mundo X (mx)"
+    [ -n "$transport" ] && say "协议: $protocol"
     [ -n "$transport" ] && say "传输: $(transport_display_name "$transport")"
-    if [ -n "$ech_mode" ]; then
-        if [ "$ech_mode" = "always" ]; then
-            say "节点模式: Mundo Connect + ECH"
-        else
-            say "节点模式: Mundo Connect"
-        fi
-    fi
-    [ -n "$port" ] && say "对外端口: $port"
-    [ -n "$host" ] && say "服务器地址/Host/SNI: $host"
+    [ -n "$port" ] && say "端口: $port"
+    [ -n "$host" ] && say "服务器: $host"
     [ -n "$path_value" ] && [ "$transport" != "mundordp" ] && say "路径: $path_value"
     [ "$transport" = "mundordp" ] && say "用户名: $rdp_username"
     if [ "$reverse_proxy" = "1" ]; then
@@ -879,11 +1176,16 @@ show_info() {
     elif [ -n "$core_port" ]; then
         say "监听: 0.0.0.0:$core_port"
     fi
-    say "配置: $CONFIG_FILE"
+    say "配置文件: $CONFIG_FILE"
     if [ -f "$CLIENT_URI_FILE" ]; then
         say ""
-        say "客户端 URI:"
+        say "普通 URI:"
         cat "$CLIENT_URI_FILE"
+        say ""
+    fi
+    if [ -f "$CLIENT_URI_ECH_FILE" ]; then
+        say "ECH URI:"
+        cat "$CLIENT_URI_ECH_FILE"
         say ""
     fi
 }
@@ -900,8 +1202,12 @@ uninstall_mundo_proxy() {
     if systemd_available; then
         systemctl stop mundoproxy >/dev/null 2>&1 || true
         systemctl disable mundoproxy >/dev/null 2>&1 || true
+        systemctl reset-failed mundoproxy >/dev/null 2>&1 || true
+    elif openrc_available; then
+        rc-service mundoproxy stop >/dev/null 2>&1 || true
+        rc-update del mundoproxy default >/dev/null 2>&1 || true
     fi
-    rm -f "$SERVICE_FILE" "$COMMAND_BIN" "$CORE_BIN" "$CORE_BACKUP_BIN"
+    rm -f "$SERVICE_FILE" "$OPENRC_SERVICE_FILE" "$COMMAND_BIN" "$CORE_BIN" "$CORE_BACKUP_BIN"
     remove_nginx_config
     rm -rf "$APP_DIR" "$LOG_DIR"
     if systemd_available; then
@@ -925,31 +1231,18 @@ install_again() {
 
 help_msg() {
     cat <<EOF
-Mundo Proxy 管理脚本
+Mundo Proxy
 
 命令:
-  mp                 打开菜单
-  mp install         重新执行本地安装脚本
-  mp deps            安装运行依赖
-  mp config          重新生成 Mundo X 配置
-  mp start           启动服务
-  mp stop            停止服务
-  mp restart         重启服务
-  mp status          查看状态
-  mp log             查看 access 日志
-  mp error-log       查看 error 日志
-  mp info            查看安装信息
-  mp run             前台运行内核
-  mp uninstall       卸载并删除 Mundo Proxy
-
-说明:
-  mundoproxy 是内核二进制；mp 是管理快捷指令。
-
-协议说明:
-  默认生成 Mundo X (mx)。
-  推荐传输 Mundo Connect 1 (mc1) 与 Mundo Connect RDP Protocol (mundordp)。
-  可选传输还包括 XHTTP、gRPC、WebSocket。
-  Mundo Connect + ECH 只用于 Mundo X + WebSocket、Mundo X + Mundo Connect 1、Mundo X + XHTTP。
+  mp           菜单
+  mp info      显示配置和 URI
+  mp config    重新生成配置
+  mp restart   重启
+  mp status    状态
+  mp autostart 开关开机启动
+  mp log       日志
+  mp error-log 错误日志
+  mp uninstall 卸载
 EOF
 }
 
@@ -957,13 +1250,15 @@ menu() {
     while true; do
         show_info
         say ""
-        say "${blue}Mundo Proxy 管理菜单${none}"
-        say "  1) 查看信息"
-        say "  2) 重新生成配置"
-        say "  3) 重启服务"
-        say "  4) 查看状态"
-        say "  5) 查看错误日志"
-        say "  6) 卸载 Mundo Proxy"
+        say "${blue}菜单${none}"
+        say "  1) 显示配置"
+        say "  2) 重新配置"
+        say "  3) 重启"
+        say "  4) 状态"
+        say "  5) 开启开机启动 $(autostart_status_label)"
+        say "  6) 关闭开机启动 $(autostart_status_label)"
+        say "  7) 错误日志"
+        say "  8) 卸载"
         say "  0) 退出"
         local choice
         read -r -p "请选择 [1]: " choice
@@ -972,8 +1267,10 @@ menu() {
             2) configure ;;
             3) restart_service ;;
             4) status_service ;;
-            5) show_log "$ERROR_LOG" ;;
-            6) uninstall_mundo_proxy ;;
+            5) enable_autostart ;;
+            6) disable_autostart ;;
+            7) show_log "$ERROR_LOG" ;;
+            8) uninstall_mundo_proxy ;;
             0) exit 0 ;;
             *) warn "无效选择。" ;;
         esac
@@ -1007,6 +1304,19 @@ main() {
             ;;
         restart)
             restart_service
+            ;;
+        enable-autostart|autostart-on|enable-boot)
+            enable_autostart
+            ;;
+        disable-autostart|autostart-off|disable-boot)
+            disable_autostart
+            ;;
+        autostart)
+            if autostart_enabled; then
+                disable_autostart
+            else
+                enable_autostart
+            fi
             ;;
         status)
             status_service

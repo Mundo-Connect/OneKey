@@ -9,6 +9,7 @@ SH_DIR="$APP_DIR/sh"
 CONFIG_FILE="$APP_DIR/config.json"
 LOG_DIR="/var/log/mundoproxy"
 SERVICE_FILE="/etc/systemd/system/mundoproxy.service"
+OPENRC_SERVICE_FILE="/etc/init.d/mundoproxy"
 COMMAND_BIN="/usr/local/bin/mp"
 CORE_BIN="/usr/local/bin/mundoproxy"
 CORE_BACKUP_BIN="$BIN_DIR/mundoproxy"
@@ -121,6 +122,27 @@ WantedBy=multi-user.target
 EOF
 }
 
+write_openrc_service() {
+    cat > "$OPENRC_SERVICE_FILE" <<EOF
+#!/sbin/openrc-run
+
+name="Mundo Proxy"
+description="Mundo Proxy"
+command="$CORE_BIN"
+command_args="run -c $CONFIG_FILE"
+command_background="yes"
+pidfile="/run/mundoproxy.pid"
+output_log="$LOG_DIR/service.log"
+error_log="$LOG_DIR/service.err"
+
+depend() {
+    need net
+    after firewall
+}
+EOF
+    chmod +x "$OPENRC_SERVICE_FILE"
+}
+
 install_files() {
     local source_dir="$1"
     local core_source="$2"
@@ -146,29 +168,32 @@ EOF
 }
 
 enable_service() {
-    if ! command -v systemctl >/dev/null 2>&1; then
-        warn "当前系统没有 systemctl，已完成文件安装，请手动运行：mundoproxy run -c $CONFIG_FILE"
-        return 0
+    if command -v systemctl >/dev/null 2>&1; then
+        write_service
+        systemctl daemon-reload
+        systemctl enable mundoproxy >/dev/null 2>&1 || true
+        systemctl restart mundoproxy
+    elif command -v rc-service >/dev/null 2>&1 && command -v rc-update >/dev/null 2>&1; then
+        write_openrc_service
+        rc-update add mundoproxy default >/dev/null 2>&1 || true
+        rc-service mundoproxy restart
+    else
+        warn "未检测到 systemd 或 OpenRC，请手动运行：mundoproxy run -c $CONFIG_FILE"
     fi
-
-    write_service
-    systemctl daemon-reload
-    systemctl enable mundoproxy >/dev/null 2>&1 || true
-    systemctl restart mundoproxy
 }
 
 usage() {
     cat <<EOF
-Mundo Proxy 本地安装脚本
+Mundo Proxy 安装脚本
 
 用法:
-  ./install.sh             安装依赖、复制本地 mundoproxy 内核、生成配置并启动服务
-  ./install.sh --deps      只安装依赖
-  ./install.sh --uninstall 卸载 Mundo Proxy
-  ./install.sh --help      显示帮助
+  ./install.sh             安装并生成配置
+  ./install.sh --deps      安装依赖
+  ./install.sh --uninstall 卸载
+  ./install.sh --help      帮助
 
 要求:
-  编译好的静态内核文件必须与 install.sh 在同一目录，文件名为 mundoproxy。
+  install.sh 同目录需要有 mundoproxy 文件。
 EOF
 }
 
@@ -188,8 +213,19 @@ main() {
             if [ -x "$SH_DIR/src/init.sh" ]; then
                 "$SH_DIR/src/init.sh" uninstall
             else
-                rm -f "$SERVICE_FILE" "$COMMAND_BIN"
+                if command -v systemctl >/dev/null 2>&1; then
+                    systemctl stop mundoproxy >/dev/null 2>&1 || true
+                    systemctl disable mundoproxy >/dev/null 2>&1 || true
+                    systemctl reset-failed mundoproxy >/dev/null 2>&1 || true
+                elif command -v rc-service >/dev/null 2>&1 && command -v rc-update >/dev/null 2>&1; then
+                    rc-service mundoproxy stop >/dev/null 2>&1 || true
+                    rc-update del mundoproxy default >/dev/null 2>&1 || true
+                fi
+                rm -f "$SERVICE_FILE" "$OPENRC_SERVICE_FILE" "$COMMAND_BIN" "$CORE_BIN" "$CORE_BACKUP_BIN"
                 rm -rf "$APP_DIR" "$LOG_DIR"
+                if command -v systemctl >/dev/null 2>&1; then
+                    systemctl daemon-reload >/dev/null 2>&1 || true
+                fi
             fi
             exit 0
             ;;
@@ -201,8 +237,7 @@ main() {
     local core_source
     core_source="$(find_core_source "$source_dir")" || err "未找到本地 Mundo Proxy 内核。请把已编译好的 mundoproxy 放在 install.sh 同一目录。"
 
-    say "${blue}Mundo Proxy 本地部署${none}"
-    say "源码主页: https://github.com/Mundo-Connect"
+    say "${blue}Mundo Proxy 安装${none}"
     say "内核来源: $core_source"
 
     install_dependencies
@@ -220,10 +255,6 @@ main() {
 
     enable_service
     ok "安装完成。"
-    say "脚本来源: Mundo Connect 专用本地部署脚本 (GPLv3)"
-    say "GitHub: https://github.com/Mundo-Connect"
-    say "管理命令: mp"
-    say "内核命令: mundoproxy"
     say ""
     "$SH_DIR/src/init.sh" info
 }
