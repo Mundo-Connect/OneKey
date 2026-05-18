@@ -500,8 +500,7 @@ render_stream_settings() {
     local host="$2"
     local path="$3"
     local username="$4"
-    local connections="$5"
-    local reverse_proxy="$6"
+    local reverse_proxy="$5"
     local service_name
     local mc1_mode="auto"
     local mc1_disable_h3="false"
@@ -539,8 +538,7 @@ EOF
 $(render_tls_settings "$host"),
     "mundordpSettings": {
       "username": "$username",
-      "useTLSCertificate": true,
-      "connections": $connections
+      "useTLSCertificate": true
     }
   }
 EOF
@@ -599,12 +597,11 @@ write_config() {
     local host="$5"
     local path="$6"
     local username="$7"
-    local connections="$8"
-    local listen_addr="$9"
-    local reverse_proxy="${10}"
+    local listen_addr="$8"
+    local reverse_proxy="${9}"
     local stream_settings
     local inbound_settings
-    stream_settings="$(render_stream_settings "$transport" "$host" "$path" "$username" "$connections" "$reverse_proxy")"
+    stream_settings="$(render_stream_settings "$transport" "$host" "$path" "$username" "$reverse_proxy")"
     inbound_settings="$(render_inbound_settings "$protocol" "$token")"
 
     ensure_dirs
@@ -719,12 +716,11 @@ write_profile() {
     local client_host="$6"
     local path="$7"
     local username="$8"
-    local connections="$9"
-    local ech_mode="${10}"
-    local reverse_proxy="${11}"
-    local external_port="${12}"
-    local core_port="${13}"
-    local cdn_enabled="${14:-0}"
+    local ech_mode="$9"
+    local reverse_proxy="${10}"
+    local external_port="${11}"
+    local core_port="${12}"
+    local cdn_enabled="${13:-0}"
     cat > "$PROFILE_FILE" <<EOF
 PROTOCOL='$protocol'
 TRANSPORT='$transport'
@@ -735,7 +731,6 @@ HOST='$host'
 CLIENT_HOST='$client_host'
 PATH_VALUE='$path'
 RDP_USERNAME='$username'
-RDP_CONNECTIONS='$connections'
 ECH_MODE='$ech_mode'
 REVERSE_PROXY='$reverse_proxy'
 CDN_ENABLED='$cdn_enabled'
@@ -1055,14 +1050,10 @@ configure() {
     esac
 
     local username="Administrator"
-    local connections=1
     if [ "$transport" = "mundordp" ]; then
         username="$(prompt_default "用户名" "Administrator")"
         username="$(printf "%s" "$username" | tr -cd 'A-Za-z0-9._@-')"
         [ -n "$username" ] || username="Administrator"
-        connections="$(prompt_default "连接数" "1")"
-        [[ "$connections" =~ ^[0-9]+$ ]] || connections=1
-        [ "$connections" -ge 1 ] && [ "$connections" -le 255 ] || connections=1
     fi
 
     local reverse_proxy=0
@@ -1092,8 +1083,8 @@ configure() {
         listen_addr="127.0.0.1"
     fi
 
-    write_config "$protocol" "$transport" "$core_port" "$token" "$host" "$path" "$username" "$connections" "$listen_addr" "$reverse_proxy"
-    write_profile "$protocol" "$transport" "$core_port" "$token" "$host" "$client_host" "$path" "$username" "$connections" "$ech_mode" "$reverse_proxy" "$external_port" "$core_port" "$CDN_ENABLED"
+    write_config "$protocol" "$transport" "$core_port" "$token" "$host" "$path" "$username" "$listen_addr" "$reverse_proxy"
+    write_profile "$protocol" "$transport" "$core_port" "$token" "$host" "$client_host" "$path" "$username" "$ech_mode" "$reverse_proxy" "$external_port" "$core_port" "$CDN_ENABLED"
     write_client_uris "$protocol" "$transport" "$external_port" "$token" "$client_host" "$host" "$path" "$username" "$reverse_proxy"
     if [ "$reverse_proxy" -eq 1 ]; then
         write_nginx_config "$transport" "$external_port" "$core_port" "$host" "$path"
