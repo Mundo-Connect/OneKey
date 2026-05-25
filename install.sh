@@ -52,6 +52,41 @@ find_core_source() {
     return 1
 }
 
+systemd_available() {
+    command -v systemctl >/dev/null 2>&1
+}
+
+openrc_available() {
+    command -v rc-service >/dev/null 2>&1 && command -v rc-update >/dev/null 2>&1
+}
+
+service_installed() {
+    [ -x "$CORE_BIN" ] ||
+    [ -f "$SERVICE_FILE" ] ||
+    [ -f "$OPENRC_SERVICE_FILE" ] ||
+    [ -f "$CONFIG_FILE" ]
+}
+
+service_running() {
+    if systemd_available && systemctl list-unit-files mundoproxy.service >/dev/null 2>&1; then
+        systemctl is-active --quiet mundoproxy && return 0
+    fi
+    if openrc_available && [ -f "$OPENRC_SERVICE_FILE" ]; then
+        rc-service mundoproxy status >/dev/null 2>&1 && return 0
+    fi
+    pgrep -f "$CORE_BIN run -c $CONFIG_FILE" >/dev/null 2>&1
+}
+
+stop_service_if_installed() {
+    if systemd_available && systemctl list-unit-files mundoproxy.service >/dev/null 2>&1; then
+        systemctl stop mundoproxy >/dev/null 2>&1 || true
+    elif openrc_available && [ -f "$OPENRC_SERVICE_FILE" ]; then
+        rc-service mundoproxy stop >/dev/null 2>&1 || true
+    else
+        pkill -f "$CORE_BIN run -c $CONFIG_FILE" >/dev/null 2>&1 || true
+    fi
+}
+
 detect_pkg_manager() {
     if command -v apt-get >/dev/null 2>&1; then
         echo apt
@@ -168,15 +203,24 @@ EOF
 }
 
 enable_service() {
-    if command -v systemctl >/dev/null 2>&1; then
+    local should_start="${1:-1}"
+    if systemd_available; then
         write_service
         systemctl daemon-reload
         systemctl enable mundoproxy >/dev/null 2>&1 || true
-        systemctl restart mundoproxy
-    elif command -v rc-service >/dev/null 2>&1 && command -v rc-update >/dev/null 2>&1; then
+        if [ "$should_start" -eq 1 ]; then
+            systemctl start mundoproxy
+        else
+            systemctl stop mundoproxy >/dev/null 2>&1 || true
+        fi
+    elif openrc_available; then
         write_openrc_service
         rc-update add mundoproxy default >/dev/null 2>&1 || true
-        rc-service mundoproxy restart
+        if [ "$should_start" -eq 1 ]; then
+            rc-service mundoproxy start
+        else
+            rc-service mundoproxy stop >/dev/null 2>&1 || true
+        fi
     else
         warn "未检测到 systemd 或 OpenRC，请手动运行：mundoproxy run -c $CONFIG_FILE"
     fi
@@ -237,13 +281,30 @@ main() {
     local core_source
     core_source="$(find_core_source "$source_dir")" || err "未找到本地 Mundo Proxy 内核。请把已编译好的 mundoproxy 放在 install.sh 同一目录。"
 
-    say "${blue}Mundo Proxy 安装${none}"
+    local update_mode=0
+    local was_running=0
+    if service_installed; then
+        update_mode=1
+        if service_running; then
+            was_running=1
+        fi
+        warn "检测到已安装，执行更新（保留现有配置）"
+        stop_service_if_installed
+    fi
+
+    if [ "$update_mode" -eq 1 ]; then
+        say "${blue}Mundo Proxy 更新${none}"
+    else
+        say "${blue}Mundo Proxy 安装${none}"
+    fi
     say "内核来源: $core_source"
 
     install_dependencies
     install_files "$source_dir" "$core_source"
 
-    if [ ! -s "$CONFIG_FILE" ]; then
+    if [ "$update_mode" -eq 1 ]; then
+        warn "更新模式保留配置文件: $CONFIG_FILE"
+    elif [ ! -s "$CONFIG_FILE" ]; then
         "$SH_DIR/src/init.sh" config --no-restart
     else
         warn "已存在配置文件: $CONFIG_FILE"
@@ -253,8 +314,17 @@ main() {
         esac
     fi
 
-    enable_service
-    ok "安装完成。"
+    if [ "$update_mode" -eq 1 ]; then
+        enable_service "$was_running"
+        if [ "$was_running" -eq 1 ]; then
+            ok "更新完成，服务已重新启动。"
+        else
+            ok "更新完成，服务保持停止。"
+        fi
+    else
+        enable_service 1
+        ok "安装完成。"
+    fi
     say ""
     "$SH_DIR/src/init.sh" info
 }
