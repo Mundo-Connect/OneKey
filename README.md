@@ -17,6 +17,8 @@ sudo ./install.sh
 mp
 mp info
 mp config
+mp add-node
+mp del-node
 mp restart
 mp status
 mp log
@@ -35,6 +37,7 @@ URI 路径：
 ```text
 /etc/mundoproxy/client.uri
 /etc/mundoproxy/client-ech.uri
+/etc/mundoproxy/uris/*.uri
 ```
 
 MundoCA 证书文件路径：
@@ -57,6 +60,7 @@ MundoCA 证书文件路径：
 - `mx+xhttp`
 - `mx+grpc`
 - `mx+ws`
+- `mx+mundosql`
 
 其他协议只支持 `mc1` 和 `mundordp`：
 
@@ -72,6 +76,8 @@ MundoCA 证书文件路径：
 `mx+mc1`、`mx+xhttp`、`mx+ws` 会同时生成普通 URI 和 ECH URI。
 
 `mc1`、`xhttp`、`ws` 支持 CDN。配置时可以选择填写 CDN 优选地址；启用后 URI 使用优选地址连接，SNI/Host 仍使用原域名。
+
+`mx+mundosql` 使用 MySQL 外观传输，默认端口 `3306`，强制 TLS。脚本会写入 `streamSettings.mundosqlSettings`，默认数据库用户名是 `mundouser`，密码使用配置时生成或填写的 token。
 
 ## 认证方式
 
@@ -114,8 +120,27 @@ mp enable-autostart
 mp disable-autostart
 ```
 
+## 多入站
+
+首次安装只引导生成一个入站，不会提示多节点。
+
+安装完成后运行 `mp`，可以在菜单里新增或删除入站。每个入站会独立写入 `/etc/mundoproxy/nodes/*.env`，脚本根据这些节点元数据重建 `/etc/mundoproxy/config.json` 的 `inbounds` 数组。
+
+每个入站会生成独立 URI：
+
+```text
+/etc/mundoproxy/uris/节点名.uri
+/etc/mundoproxy/uris/节点名-ech.uri
+```
+
+`mp info` 会显示所有入站及对应 URI。删除最后一个入站时，脚本会提示确认；确认删除后会同步停止服务，避免空配置继续运行。
+
 ## Nginx 反代
 
 默认不启用反代。
 
-启用反代后，Mundo Proxy 监听 `127.0.0.1:后端端口`，Nginx 对外监听端口并转发。`mundordp` 不使用 Nginx 反代。
+启用反代前，如果对外端口是 `443`，脚本会检测当前是否已有监听程序并提示；默认仍然不启用 Nginx。
+
+启用反代后，Mundo Proxy 监听 `127.0.0.1:后端端口`，Nginx 对外监听端口并转发。`mundordp` 和 `mundosql` 不使用 Nginx 反代。
+
+多入站启用反代时，脚本会生成 `/etc/nginx/conf.d/mundoproxy.conf`。相同端口和相同域名的 HTTP 类传输会聚合到同一个 `server`，通过不同 `location` 分发；如果路径冲突，脚本会拒绝生成配置，避免某个入站被覆盖。

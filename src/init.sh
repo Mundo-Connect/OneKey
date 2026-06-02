@@ -29,6 +29,8 @@ CORE_BACKUP_BIN="$BIN_DIR/mundoproxy"
 CLIENT_URI_FILE="$APP_DIR/client.uri"
 CLIENT_URI_ECH_FILE="$APP_DIR/client-ech.uri"
 PROFILE_FILE="$APP_DIR/profile.env"
+NODE_DIR="$APP_DIR/nodes"
+URI_DIR="$APP_DIR/uris"
 NGINX_CONF_FILE="/etc/nginx/conf.d/mundoproxy.conf"
 
 red='\033[31m'
@@ -250,7 +252,7 @@ mundo_ca_supported_protocol() {
 
 mundo_ca_supported_transport() {
     case "$1" in
-        mc1|mundordp|xhttp|grpc|websocket) return 0 ;;
+        mc1|mundordp|mundosql|xhttp|grpc|websocket) return 0 ;;
         *) return 1 ;;
     esac
 }
@@ -531,6 +533,9 @@ normalize_transport() {
         "5"|"ws"|"websocket")
             echo "websocket"
             ;;
+        "6"|"mundosql")
+            echo "mundosql"
+            ;;
         *)
             return 1
             ;;
@@ -573,7 +578,7 @@ parse_protocol_transport() {
     CHOSEN_PROTOCOL="$(normalize_protocol "$protocol_part")" || return 1
     CHOSEN_TRANSPORT="$(normalize_transport "$transport_part")" || return 1
     protocol_supports_transport "$CHOSEN_PROTOCOL" "$CHOSEN_TRANSPORT" || {
-        err "只有 mx 支持 ws、grpc、xhttp；$CHOSEN_PROTOCOL 只能使用 mc1 或 mundordp。"
+        err "只有 mx 支持 ws、grpc、xhttp、mundosql；$CHOSEN_PROTOCOL 只能使用 mc1 或 mundordp。"
     }
 }
 
@@ -584,6 +589,7 @@ transport_display_name() {
         xhttp) echo "xhttp" ;;
         grpc) echo "grpc" ;;
         websocket) echo "ws" ;;
+        mundosql) echo "mundosql" ;;
         *) echo "$1" ;;
     esac
 }
@@ -606,6 +612,7 @@ uri_node_name() {
         xhttp) name="$protocol-xhttp" ;;
         grpc) name="$protocol-grpc" ;;
         websocket) name="$protocol-ws" ;;
+        mundosql) name="$protocol-mundosql" ;;
         *) name="$protocol" ;;
     esac
     if [ "$ech_mode" = "always" ]; then
@@ -643,6 +650,7 @@ cdn_capable_transport() {
 default_port_for_transport() {
     case "$1" in
         mundordp) echo "3389" ;;
+        mundosql) echo "3306" ;;
         *) echo "443" ;;
     esac
 }
@@ -661,6 +669,7 @@ choose_protocol_transport() {
     say "  xhttp (XHTTP，仅 mx，CDN)"
     say "  grpc (gRPC，仅 mx)"
     say "  ws (WebSocket，仅 mx，CDN)"
+    say "  mundosql (MundoSQL，仅 mx，默认端口 3306)"
     local choice
     read -r -p "协议+传输 [mx+mundordp]: " choice
     parse_protocol_transport "$choice" || err "不支持的协议或传输。"
@@ -693,7 +702,7 @@ choose_cdn_address() {
 }
 
 ensure_dirs() {
-    mkdir -p "$APP_DIR" "$BIN_DIR" "$SH_DIR/src" "$CERT_DIR" "$LOG_DIR"
+    mkdir -p "$APP_DIR" "$BIN_DIR" "$SH_DIR/src" "$CERT_DIR" "$LOG_DIR" "$NODE_DIR" "$URI_DIR"
     touch "$ACCESS_LOG" "$ERROR_LOG"
 }
 
@@ -752,14 +761,16 @@ prepare_certificate() {
 
 render_tls_settings() {
     local host="$1"
+    local cert_file="${2:-$CERT_FILE}"
+    local key_file="${3:-$KEY_FILE}"
     if is_ip_address "$host"; then
         cat <<EOF
     "security": "tls",
     "tlsSettings": {
       "certificates": [
         {
-          "certificateFile": "$CERT_FILE",
-          "keyFile": "$KEY_FILE"
+          "certificateFile": "$cert_file",
+          "keyFile": "$key_file"
         }
       ]
     }
@@ -772,8 +783,8 @@ EOF
       "serverName": "$host",
       "certificates": [
         {
-          "certificateFile": "$CERT_FILE",
-          "keyFile": "$KEY_FILE"
+          "certificateFile": "$cert_file",
+          "keyFile": "$key_file"
         }
       ]
     }
@@ -787,6 +798,9 @@ render_stream_settings() {
     local username="$4"
     local reverse_proxy="$5"
     local ca_cert="${6:-}"
+    local password="${7:-}"
+    local cert_file="${8:-$CERT_FILE}"
+    local key_file="${9:-$KEY_FILE}"
     local service_name
     local mc1_mode="auto"
     local mc1_disable_h3="false"
@@ -801,7 +815,7 @@ render_stream_settings() {
             cat <<EOF
 {
     "network": "mc1",
-$(render_tls_settings "$host"),
+$(render_tls_settings "$host" "$cert_file" "$key_file"),
     "mc1Settings": {
       "path": "$path"$(json_host_field "$host" 6),
       "mode": "$mc1_mode",
@@ -814,10 +828,24 @@ EOF
             cat <<EOF
 {
     "network": "mundordp",
-$(render_tls_settings "$host"),
+$(render_tls_settings "$host" "$cert_file" "$key_file"),
     "mundordpSettings": {
       "username": "$username",
       "useTLSCertificate": true$(json_mundo_ca_field "$ca_cert" 6)
+    }
+  }
+EOF
+            ;;
+        mundosql)
+            cat <<EOF
+{
+    "network": "mundosql",
+$(render_tls_settings "$host" "$cert_file" "$key_file"),
+    "mundosqlSettings": {
+      "username": "$username",
+      "password": "$password",
+      "database": "app",
+      "connections": 1$(json_mundo_ca_field "$ca_cert" 6)
     }
   }
 EOF
@@ -826,7 +854,7 @@ EOF
             cat <<EOF
 {
     "network": "xhttp",
-$(render_tls_settings "$host"),
+$(render_tls_settings "$host" "$cert_file" "$key_file"),
     "xhttpSettings": {
       "path": "$path"$(json_host_field "$host" 6),
       "mode": "auto"$(json_mundo_ca_field "$ca_cert" 6)
@@ -838,7 +866,7 @@ EOF
             cat <<EOF
 {
     "network": "grpc",
-$(render_tls_settings "$host"),
+$(render_tls_settings "$host" "$cert_file" "$key_file"),
     "grpcSettings": {
       "serviceName": "$service_name"$(json_authority_field "$host" 6),
       "multiMode": true,
@@ -854,7 +882,7 @@ EOF
             cat <<EOF
 {
     "network": "websocket",
-$(render_tls_settings "$host"),
+$(render_tls_settings "$host" "$cert_file" "$key_file"),
     "wsSettings": {
       "path": "$path"$(json_host_field "$host" 6)$(json_mundo_ca_field "$ca_cert" 6)
     }
@@ -862,6 +890,45 @@ $(render_tls_settings "$host"),
 EOF
             ;;
     esac
+}
+
+render_inbound_json() {
+    local protocol="$1"
+    local transport="$2"
+    local port="$3"
+    local token="$4"
+    local host="$5"
+    local path="$6"
+    local username="$7"
+    local listen_addr="$8"
+    local reverse_proxy="${9}"
+    local ca_enabled="${10:-0}"
+    local ca_cert="${11:-}"
+    local cert_file="${12:-$CERT_FILE}"
+    local key_file="${13:-$KEY_FILE}"
+    local tag="${14:-$protocol-$transport}"
+    local stream_settings
+    local inbound_settings
+    stream_settings="$(render_stream_settings "$transport" "$host" "$path" "$username" "$reverse_proxy" "$ca_cert" "$token" "$cert_file" "$key_file")"
+    inbound_settings="$(render_inbound_settings "$protocol" "$token" "$ca_enabled")"
+
+    cat <<EOF
+    {
+      "tag": "$tag",
+      "listen": "$listen_addr",
+      "port": $port,
+      "protocol": "$protocol",
+      "settings": $inbound_settings,
+      "streamSettings": $stream_settings,
+      "sniffing": {
+        "enabled": true,
+        "destOverride": [
+          "http",
+          "tls"
+        ]
+      }
+    }
+EOF
 }
 
 write_config() {
@@ -876,10 +943,6 @@ write_config() {
     local reverse_proxy="${9}"
     local ca_enabled="${10:-0}"
     local ca_cert="${11:-}"
-    local stream_settings
-    local inbound_settings
-    stream_settings="$(render_stream_settings "$transport" "$host" "$path" "$username" "$reverse_proxy" "$ca_cert")"
-    inbound_settings="$(render_inbound_settings "$protocol" "$token" "$ca_enabled")"
 
     ensure_dirs
     cat > "$CONFIG_FILE" <<EOF
@@ -890,21 +953,7 @@ write_config() {
     "loglevel": "warning"
   },
   "inbounds": [
-    {
-      "tag": "$protocol-$transport",
-      "listen": "$listen_addr",
-      "port": $port,
-      "protocol": "$protocol",
-      "settings": $inbound_settings,
-      "streamSettings": $stream_settings,
-      "sniffing": {
-        "enabled": true,
-        "destOverride": [
-          "http",
-          "tls"
-        ]
-      }
-    }
+$(render_inbound_json "$protocol" "$transport" "$port" "$token" "$host" "$path" "$username" "$listen_addr" "$reverse_proxy" "$ca_enabled" "$ca_cert" "$CERT_FILE" "$KEY_FILE" "$protocol-$transport")
   ],
   "outbounds": [
     {
@@ -1075,8 +1124,11 @@ build_client_uri() {
         mc1_mode="h2"
     fi
 
-    local query="security=tls&type=$(url_encode "$uri_type")&fp=chrome&encryption=none"
-    if ! is_ip_address "$server_host"; then
+    local query="security=tls&type=$(url_encode "$uri_type")&encryption=none"
+    if [ "$transport" != "mundosql" ]; then
+        query="$query&fp=chrome"
+    fi
+    if [ "$transport" != "mundosql" ] && ! is_ip_address "$server_host"; then
         query="$query&sni=$(url_encode "$server_host")"
     fi
     case "$transport" in
@@ -1104,6 +1156,9 @@ build_client_uri() {
             query="$query&serviceName=$(url_encode "$(service_name_for_path "$path")")"
             ;;
         mundordp)
+            query="$query&username=$(url_encode "$username")"
+            ;;
+        mundosql)
             query="$query&username=$(url_encode "$username")"
             ;;
     esac
@@ -1142,25 +1197,249 @@ write_client_uri() {
     chmod 600 "$CLIENT_URI_FILE"
 }
 
-write_client_uris() {
-    local protocol="$1"
-    local transport="$2"
-    local port="$3"
-    local token="$4"
-    local connect_host="$5"
-    local server_host="$6"
-    local path="$7"
-    local username="$8"
-    local reverse_proxy="${9:-0}"
-    local client_cert="${10:-}"
-    build_client_uri "$protocol" "$transport" "$port" "$token" "$connect_host" "$server_host" "$path" "$username" "off" "$reverse_proxy" "$client_cert" > "$CLIENT_URI_FILE"
-    chmod 600 "$CLIENT_URI_FILE"
+write_client_uris_to_files() {
+    local normal_file="$1"
+    local ech_file="$2"
+    local protocol="$3"
+    local transport="$4"
+    local port="$5"
+    local token="$6"
+    local connect_host="$7"
+    local server_host="$8"
+    local path="$9"
+    local username="${10}"
+    local reverse_proxy="${11:-0}"
+    local client_cert="${12:-}"
+    mkdir -p "$(dirname "$normal_file")" "$(dirname "$ech_file")"
+    build_client_uri "$protocol" "$transport" "$port" "$token" "$connect_host" "$server_host" "$path" "$username" "off" "$reverse_proxy" "$client_cert" > "$normal_file"
+    chmod 600 "$normal_file"
     if ech_capable_transport "$protocol" "$transport" && ! is_ip_address "$server_host"; then
-        build_client_uri "$protocol" "$transport" "$port" "$token" "$connect_host" "$server_host" "$path" "$username" "always" "$reverse_proxy" "$client_cert" > "$CLIENT_URI_ECH_FILE"
-        chmod 600 "$CLIENT_URI_ECH_FILE"
+        build_client_uri "$protocol" "$transport" "$port" "$token" "$connect_host" "$server_host" "$path" "$username" "always" "$reverse_proxy" "$client_cert" > "$ech_file"
+        chmod 600 "$ech_file"
     else
-        rm -f "$CLIENT_URI_ECH_FILE"
+        rm -f "$ech_file"
     fi
+}
+
+write_client_uris() {
+    write_client_uris_to_files "$CLIENT_URI_FILE" "$CLIENT_URI_ECH_FILE" "$@"
+}
+
+sanitize_node_id() {
+    local value="$1"
+    value="$(printf "%s" "$value" | tr -cd 'A-Za-z0-9._-')"
+    [ -n "$value" ] || value="node"
+    printf "%s" "$value"
+}
+
+node_profile_path() {
+    printf "%s/%s.env" "$NODE_DIR" "$(sanitize_node_id "$1")"
+}
+
+node_uri_path() {
+    printf "%s/%s.uri" "$URI_DIR" "$(sanitize_node_id "$1")"
+}
+
+node_ech_uri_path() {
+    printf "%s/%s-ech.uri" "$URI_DIR" "$(sanitize_node_id "$1")"
+}
+
+unique_node_id() {
+    local base
+    local id
+    local index=2
+    base="$(sanitize_node_id "$1-$2-$3")"
+    id="$base"
+    while [ -f "$(node_profile_path "$id")" ]; do
+        id="$base-$index"
+        index=$((index + 1))
+    done
+    printf "%s" "$id"
+}
+
+collect_node_files() {
+    NODE_FILES=()
+    local file
+    for file in "$NODE_DIR"/*.env; do
+        [ -f "$file" ] || continue
+        NODE_FILES+=("$file")
+    done
+}
+
+node_profile_count() {
+    collect_node_files
+    printf "%s" "${#NODE_FILES[@]}"
+}
+
+source_node_profile() {
+    local file="$1"
+    NODE_ID=""
+    PROTOCOL="mx"
+    TRANSPORT=""
+    PORT=""
+    CORE_PORT=""
+    TOKEN=""
+    HOST=""
+    CLIENT_HOST=""
+    PATH_VALUE="/"
+    RDP_USERNAME="Administrator"
+    REVERSE_PROXY="0"
+    CDN_ENABLED="0"
+    CA_ENABLED="0"
+    MUNDO_CA_CERTIFICATE=""
+    MUNDO_CA_CLIENT_CERTIFICATE=""
+    MUNDO_CA_CLIENT_PUBLIC_KEY=""
+    MUNDO_CA_CLIENT_KEYPAIR_FILE=""
+    LISTEN_ADDR="0.0.0.0"
+    NODE_CERT_FILE="$CERT_FILE"
+    NODE_KEY_FILE="$KEY_FILE"
+    NODE_URI_FILE=""
+    NODE_ECH_URI_FILE=""
+    TAG=""
+    # shellcheck disable=SC1090
+    . "$file"
+    NODE_ID="${NODE_ID:-$(basename "$file" .env)}"
+    CLIENT_HOST="${CLIENT_HOST:-$HOST}"
+    TAG="${TAG:-$NODE_ID}"
+    NODE_CERT_FILE="${NODE_CERT_FILE:-$CERT_FILE}"
+    NODE_KEY_FILE="${NODE_KEY_FILE:-$KEY_FILE}"
+    NODE_URI_FILE="${NODE_URI_FILE:-$(node_uri_path "$NODE_ID")}"
+    NODE_ECH_URI_FILE="${NODE_ECH_URI_FILE:-$(node_ech_uri_path "$NODE_ID")}"
+}
+
+write_node_profile() {
+    local node_id="$1"
+    local protocol="$2"
+    local transport="$3"
+    local external_port="$4"
+    local core_port="$5"
+    local token="$6"
+    local host="$7"
+    local client_host="$8"
+    local path="$9"
+    local username="${10}"
+    local reverse_proxy="${11}"
+    local cdn_enabled="${12:-0}"
+    local ca_enabled="${13:-0}"
+    local ca_cert_b64="${14:-}"
+    local client_cert_b64="${15:-}"
+    local client_public_key_b64="${16:-}"
+    local client_keypair_file="${17:-}"
+    local listen_addr="${18:-0.0.0.0}"
+    local cert_file="${19:-$CERT_FILE}"
+    local key_file="${20:-$KEY_FILE}"
+    local normal_uri_file="${21:-$(node_uri_path "$node_id")}"
+    local ech_uri_file="${22:-$(node_ech_uri_path "$node_id")}"
+    local tag
+    tag="$(sanitize_node_id "$node_id")"
+    mkdir -p "$NODE_DIR" "$URI_DIR"
+    cat > "$(node_profile_path "$node_id")" <<EOF
+NODE_ID='$tag'
+TAG='$tag'
+PROTOCOL='$protocol'
+TRANSPORT='$transport'
+PORT='$external_port'
+CORE_PORT='$core_port'
+TOKEN='$token'
+HOST='$host'
+CLIENT_HOST='$client_host'
+PATH_VALUE='$path'
+RDP_USERNAME='$username'
+REVERSE_PROXY='$reverse_proxy'
+CDN_ENABLED='$cdn_enabled'
+CA_ENABLED='$ca_enabled'
+MUNDO_CA_CERTIFICATE='$ca_cert_b64'
+MUNDO_CA_CLIENT_CERTIFICATE='$client_cert_b64'
+MUNDO_CA_CLIENT_PUBLIC_KEY='$client_public_key_b64'
+MUNDO_CA_CLIENT_KEYPAIR_FILE='$client_keypair_file'
+LISTEN_ADDR='$listen_addr'
+NODE_CERT_FILE='$cert_file'
+NODE_KEY_FILE='$key_file'
+NODE_URI_FILE='$normal_uri_file'
+NODE_ECH_URI_FILE='$ech_uri_file'
+EOF
+    chmod 600 "$(node_profile_path "$node_id")"
+}
+
+migrate_profile_to_nodes() {
+    ensure_dirs
+    [ "$(node_profile_count)" -gt 0 ] && return 0
+    [ -f "$PROFILE_FILE" ] || return 0
+    # shellcheck disable=SC1090
+    . "$PROFILE_FILE"
+    local protocol="${PROTOCOL:-mx}"
+    local transport="${TRANSPORT:-mc1}"
+    local external_port="${PORT:-${CORE_PORT:-443}}"
+    local core_port="${CORE_PORT:-$external_port}"
+    local token="${TOKEN:-}"
+    local host="${HOST:-apple.com}"
+    local client_host="${CLIENT_HOST:-$host}"
+    local path="${PATH_VALUE:-/}"
+    local username="${RDP_USERNAME:-Administrator}"
+    local reverse_proxy="${REVERSE_PROXY:-0}"
+    local cdn_enabled="${CDN_ENABLED:-0}"
+    local ca_enabled="${CA_ENABLED:-0}"
+    local listen_addr="0.0.0.0"
+    local node_id
+    [ "$reverse_proxy" = "1" ] && listen_addr="127.0.0.1"
+    node_id="$(unique_node_id "$protocol" "$transport" "$external_port")"
+    write_node_profile "$node_id" "$protocol" "$transport" "$external_port" "$core_port" "$token" "$host" "$client_host" "$path" "$username" "$reverse_proxy" "$cdn_enabled" "$ca_enabled" "${MUNDO_CA_CERTIFICATE:-}" "${MUNDO_CA_CLIENT_CERTIFICATE:-}" "${MUNDO_CA_CLIENT_PUBLIC_KEY:-}" "${MUNDO_CA_CLIENT_KEYPAIR_FILE:-}" "$listen_addr" "$CERT_FILE" "$KEY_FILE" "$(node_uri_path "$node_id")" "$(node_ech_uri_path "$node_id")"
+    [ -f "$CLIENT_URI_FILE" ] && cp "$CLIENT_URI_FILE" "$(node_uri_path "$node_id")"
+    [ -f "$CLIENT_URI_ECH_FILE" ] && cp "$CLIENT_URI_ECH_FILE" "$(node_ech_uri_path "$node_id")"
+}
+
+write_config_from_nodes() {
+    ensure_dirs
+    collect_node_files
+    [ "${#NODE_FILES[@]}" -gt 0 ] || return 1
+    {
+        cat <<EOF
+{
+  "log": {
+    "access": "$ACCESS_LOG",
+    "error": "$ERROR_LOG",
+    "loglevel": "warning"
+  },
+  "inbounds": [
+EOF
+        local first=1
+        local file
+        for file in "${NODE_FILES[@]}"; do
+            source_node_profile "$file"
+            if [ "$first" -eq 0 ]; then
+                printf ",\n"
+            fi
+            render_inbound_json "$PROTOCOL" "$TRANSPORT" "$CORE_PORT" "$TOKEN" "$HOST" "$PATH_VALUE" "$RDP_USERNAME" "$LISTEN_ADDR" "$REVERSE_PROXY" "$CA_ENABLED" "$MUNDO_CA_CERTIFICATE" "$NODE_CERT_FILE" "$NODE_KEY_FILE" "$TAG"
+            first=0
+        done
+        cat <<EOF
+
+  ],
+  "outbounds": [
+    {
+      "tag": "direct",
+      "protocol": "freedom"
+    },
+    {
+      "tag": "block",
+      "protocol": "blackhole"
+    }
+  ]
+}
+EOF
+    } > "$CONFIG_FILE"
+}
+
+listen_conflicts_existing_node() {
+    local listen_addr="$1"
+    local core_port="$2"
+    collect_node_files
+    local file
+    for file in "${NODE_FILES[@]}"; do
+        source_node_profile "$file"
+        [ "$LISTEN_ADDR" = "$listen_addr" ] && [ "$CORE_PORT" = "$core_port" ] && return 0
+    done
+    return 1
 }
 
 nginx_location_path() {
@@ -1172,35 +1451,91 @@ nginx_location_path() {
     esac
 }
 
-write_nginx_config() {
-    local transport="$1"
-    local external_port="$2"
-    local core_port="$3"
-    local host="$4"
-    local path="$5"
-    local location_path
-    location_path="$(nginx_location_path "$transport" "$path")"
+nginx_server_name() {
+    local host="$1"
+    if is_domain_name "$host"; then
+        printf "%s" "$host"
+    else
+        printf "_"
+    fi
+}
+
+nginx_group_exists() {
+    local key="$1"
+    local item
+    for item in "${NGINX_GROUPS[@]}"; do
+        [ "$item" = "$key" ] && return 0
+    done
+    return 1
+}
+
+write_all_nginx_config() {
+    migrate_profile_to_nodes
+    collect_node_files
+    NGINX_GROUPS=()
+    local has_reverse_proxy=0
+    local has_websocket=0
+    local file
+    for file in "${NODE_FILES[@]}"; do
+        source_node_profile "$file"
+        [ "$REVERSE_PROXY" = "1" ] || continue
+        has_reverse_proxy=1
+        [ "$TRANSPORT" = "websocket" ] && has_websocket=1
+        local group_key="$PORT|$HOST|$NODE_CERT_FILE|$NODE_KEY_FILE"
+        nginx_group_exists "$group_key" || NGINX_GROUPS+=("$group_key")
+    done
+
+    if [ "$has_reverse_proxy" -eq 0 ]; then
+        remove_nginx_config
+        return 0
+    fi
 
     install_nginx
     mkdir -p "$(dirname "$NGINX_CONF_FILE")"
+    {
+        if [ "$has_websocket" -eq 1 ]; then
+            cat <<EOF
+map \$http_upgrade \$mundo_connection_upgrade {
+    default upgrade;
+    '' close;
+}
 
-    if [ "$transport" = "grpc" ]; then
-        cat > "$NGINX_CONF_FILE" <<EOF
+EOF
+        fi
+        local group
+        for group in "${NGINX_GROUPS[@]}"; do
+            local group_port group_host group_cert group_key_file
+            IFS='|' read -r group_port group_host group_cert group_key_file <<< "$group"
+            cat <<EOF
 server {
-    listen $external_port ssl http2;
-    server_name _;
+    listen $group_port ssl http2;
+    server_name $(nginx_server_name "$group_host");
 
-    ssl_certificate $CERT_FILE;
-    ssl_certificate_key $KEY_FILE;
+    ssl_certificate $group_cert;
+    ssl_certificate_key $group_key_file;
     ssl_protocols TLSv1.2 TLSv1.3;
     ssl_prefer_server_ciphers off;
 
     client_max_body_size 0;
 
-    location / {
-        grpc_pass grpcs://127.0.0.1:$core_port;
+EOF
+            local seen_locations=" "
+            for file in "${NODE_FILES[@]}"; do
+                source_node_profile "$file"
+                [ "$REVERSE_PROXY" = "1" ] || continue
+                [ "$PORT|$HOST|$NODE_CERT_FILE|$NODE_KEY_FILE" = "$group" ] || continue
+                local location_path
+                location_path="$(nginx_location_path "$TRANSPORT" "$PATH_VALUE")"
+                case "$seen_locations" in
+                    *" $location_path "*) err "Nginx 反代路径冲突: $group_host:$group_port $location_path" ;;
+                esac
+                seen_locations="$seen_locations$location_path "
+                if [ "$TRANSPORT" = "grpc" ]; then
+                    cat <<EOF
+    location $location_path {
+        grpc_pass grpcs://127.0.0.1:$CORE_PORT;
         grpc_ssl_server_name on;
-        grpc_ssl_name $host;
+        grpc_ssl_name $HOST;
         grpc_ssl_verify off;
         grpc_set_header Host \$host;
         grpc_set_header X-Real-IP \$remote_addr;
@@ -1209,28 +1544,12 @@ server {
         grpc_read_timeout 86400s;
         grpc_send_timeout 86400s;
     }
-}
+
 EOF
-    elif [ "$transport" = "websocket" ]; then
-        cat > "$NGINX_CONF_FILE" <<EOF
-map \$http_upgrade \$mundo_connection_upgrade {
-    default upgrade;
-    '' close;
-}
-
-server {
-    listen $external_port ssl http2;
-    server_name _;
-
-    ssl_certificate $CERT_FILE;
-    ssl_certificate_key $KEY_FILE;
-    ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_prefer_server_ciphers off;
-
-    client_max_body_size 0;
-
+                elif [ "$TRANSPORT" = "websocket" ]; then
+                    cat <<EOF
     location ^~ $location_path {
-        proxy_pass https://127.0.0.1:$core_port;
+        proxy_pass https://127.0.0.1:$CORE_PORT;
         proxy_http_version 1.1;
         proxy_set_header Host \$host;
         proxy_set_header Upgrade \$http_upgrade;
@@ -1239,30 +1558,19 @@ server {
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto https;
         proxy_ssl_server_name on;
-        proxy_ssl_name $host;
+        proxy_ssl_name $HOST;
         proxy_ssl_verify off;
         proxy_buffering off;
         proxy_request_buffering off;
         proxy_read_timeout 86400s;
         proxy_send_timeout 86400s;
     }
-}
+
 EOF
-    else
-        cat > "$NGINX_CONF_FILE" <<EOF
-server {
-    listen $external_port ssl http2;
-    server_name _;
-
-    ssl_certificate $CERT_FILE;
-    ssl_certificate_key $KEY_FILE;
-    ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_prefer_server_ciphers off;
-
-    client_max_body_size 0;
-
+                else
+                    cat <<EOF
     location ^~ $location_path {
-        proxy_pass https://127.0.0.1:$core_port;
+        proxy_pass https://127.0.0.1:$CORE_PORT;
         proxy_http_version 1.1;
         proxy_set_header Host \$host;
         proxy_set_header Connection "";
@@ -1270,7 +1578,7 @@ server {
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto https;
         proxy_ssl_server_name on;
-        proxy_ssl_name $host;
+        proxy_ssl_name $HOST;
         proxy_ssl_verify off;
         proxy_buffering off;
         proxy_request_buffering off;
@@ -1279,9 +1587,16 @@ server {
         proxy_send_timeout 86400s;
         proxy_hide_header Alt-Svc;
     }
-}
+
 EOF
-    fi
+                fi
+            done
+            cat <<EOF
+}
+
+EOF
+        done
+    } > "$NGINX_CONF_FILE"
 
     nginx -t || err "Nginx 配置检查失败。"
     if systemd_available; then
@@ -1306,16 +1621,60 @@ remove_nginx_config() {
     fi
 }
 
+port_in_use() {
+    local port="$1"
+    if command -v ss >/dev/null 2>&1; then
+        ss -H -ltn 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:)$port$"
+        return $?
+    fi
+    if command -v netstat >/dev/null 2>&1; then
+        netstat -ltn 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:)$port$"
+        return $?
+    fi
+    if command -v lsof >/dev/null 2>&1; then
+        lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1
+        return $?
+    fi
+    return 1
+}
+
+port_owner_hint() {
+    local port="$1"
+    if command -v ss >/dev/null 2>&1; then
+        ss -H -ltnp 2>/dev/null | awk -v p=":$port" '$4 ~ p "$" {print; exit}'
+        return 0
+    fi
+    if command -v netstat >/dev/null 2>&1; then
+        netstat -ltnp 2>/dev/null | awk -v p=":$port" '$4 ~ p "$" {print; exit}'
+        return 0
+    fi
+    if command -v lsof >/dev/null 2>&1; then
+        lsof -nP -iTCP:"$port" -sTCP:LISTEN 2>/dev/null | sed -n '2p'
+        return 0
+    fi
+    return 0
+}
+
 configure() {
     require_root
     ensure_dirs
 
     local no_restart=0
-    if [ "${1:-}" = "--no-restart" ]; then
-        no_restart=1
-    fi
+    local append=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --no-restart) no_restart=1 ;;
+            --append) append=1 ;;
+        esac
+        shift
+    done
 
-    say "${blue}生成配置${none}"
+    if [ "$append" -eq 1 ]; then
+        migrate_profile_to_nodes
+        say "${blue}新增入站${none}"
+    else
+        say "${blue}生成配置${none}"
+    fi
 
     local protocol
     local transport
@@ -1330,6 +1689,16 @@ configure() {
     external_port="$(prompt_default "端口" "$default_port")"
     [[ "$external_port" =~ ^[0-9]+$ ]] || err "端口必须是数字。"
     [ "$external_port" -ge 1 ] && [ "$external_port" -le 65535 ] || err "端口范围必须是 1-65535。"
+    local node_id
+    if [ "$append" -eq 1 ]; then
+        node_id="$(unique_node_id "$protocol" "$transport" "$external_port")"
+        CERT_FILE="$CERT_DIR/$node_id.crt"
+        KEY_FILE="$CERT_DIR/$node_id.key"
+    else
+        node_id="$(sanitize_node_id "$protocol-$transport-$external_port")"
+        CERT_FILE="$CERT_DIR/server.crt"
+        KEY_FILE="$CERT_DIR/server.key"
+    fi
 
     local host
     local client_host
@@ -1344,7 +1713,7 @@ configure() {
     client_host="$CLIENT_HOST"
 
     local path="/"
-    if [ "$transport" != "mundordp" ]; then
+    if [ "$transport" != "mundordp" ] && [ "$transport" != "mundosql" ]; then
         path="$(prompt_default "路径" "/$(random_hex 6)")"
         path="$(sanitize_path "$path")"
     fi
@@ -1384,12 +1753,22 @@ configure() {
         username="$(prompt_default "用户名" "Administrator")"
         username="$(printf "%s" "$username" | tr -cd 'A-Za-z0-9._@-')"
         [ -n "$username" ] || username="Administrator"
+    elif [ "$transport" = "mundosql" ]; then
+        username="$(prompt_default "数据库用户名" "mundouser")"
+        username="$(printf "%s" "$username" | tr -cd 'A-Za-z0-9._@-')"
+        [ -n "$username" ] || username="mundouser"
     fi
 
     local reverse_proxy=0
     local core_port="$external_port"
     local listen_addr="0.0.0.0"
-    if [ "$transport" != "mundordp" ]; then
+    if [ "$transport" != "mundordp" ] && [ "$transport" != "mundosql" ]; then
+        if [ "$external_port" = "443" ] && port_in_use 443; then
+            warn "检测到 443 端口已有监听程序。"
+            local owner
+            owner="$(port_owner_hint 443)"
+            [ -n "$owner" ] && warn "$owner"
+        fi
         if [ "$external_port" != "443" ]; then
             warn "当前端口不是 443。"
             if yes_no_default_no "启用 Nginx 反代"; then
@@ -1412,20 +1791,33 @@ configure() {
         [ "$core_port" != "$external_port" ] || err "反代模式下内部端口不能和对外端口相同。"
         listen_addr="127.0.0.1"
     fi
-
-    write_config "$protocol" "$transport" "$core_port" "$token" "$host" "$path" "$username" "$listen_addr" "$reverse_proxy" "$CA_ENABLED" "$CA_CERT_B64"
-    write_profile "$protocol" "$transport" "$core_port" "$token" "$host" "$client_host" "$path" "$username" "$ech_mode" "$reverse_proxy" "$external_port" "$core_port" "$CDN_ENABLED" "$CA_ENABLED" "$CA_CERT_B64" "$CLIENT_CERT_B64" "$CLIENT_PUBLIC_KEY_B64" "$MUNDO_CA_CLIENT_KEYPAIR_FILE"
-    write_client_uris "$protocol" "$transport" "$external_port" "$token" "$client_host" "$host" "$path" "$username" "$reverse_proxy" "$CLIENT_CERT_B64"
-    if [ "$reverse_proxy" -eq 1 ]; then
-        write_nginx_config "$transport" "$external_port" "$core_port" "$host" "$path"
-    else
-        remove_nginx_config
+    if [ "$append" -eq 1 ] && listen_conflicts_existing_node "$listen_addr" "$core_port"; then
+        err "已有入站监听 $listen_addr:$core_port，请换一个端口。"
     fi
+
+    local node_uri_file
+    local node_ech_uri_file
+    node_uri_file="$(node_uri_path "$node_id")"
+    node_ech_uri_file="$(node_ech_uri_path "$node_id")"
+    if [ "$append" -eq 0 ]; then
+        rm -f "$NODE_DIR"/*.env "$URI_DIR"/*.uri
+    fi
+    write_node_profile "$node_id" "$protocol" "$transport" "$external_port" "$core_port" "$token" "$host" "$client_host" "$path" "$username" "$reverse_proxy" "$CDN_ENABLED" "$CA_ENABLED" "$CA_CERT_B64" "$CLIENT_CERT_B64" "$CLIENT_PUBLIC_KEY_B64" "$MUNDO_CA_CLIENT_KEYPAIR_FILE" "$listen_addr" "$CERT_FILE" "$KEY_FILE" "$node_uri_file" "$node_ech_uri_file"
+    write_client_uris_to_files "$node_uri_file" "$node_ech_uri_file" "$protocol" "$transport" "$external_port" "$token" "$client_host" "$host" "$path" "$username" "$reverse_proxy" "$CLIENT_CERT_B64"
+    write_config_from_nodes
+    if [ "$append" -eq 0 ]; then
+        write_profile "$protocol" "$transport" "$core_port" "$token" "$host" "$client_host" "$path" "$username" "$ech_mode" "$reverse_proxy" "$external_port" "$core_port" "$CDN_ENABLED" "$CA_ENABLED" "$CA_CERT_B64" "$CLIENT_CERT_B64" "$CLIENT_PUBLIC_KEY_B64" "$MUNDO_CA_CLIENT_KEYPAIR_FILE"
+        write_client_uris "$protocol" "$transport" "$external_port" "$token" "$client_host" "$host" "$path" "$username" "$reverse_proxy" "$CLIENT_CERT_B64"
+    else
+        warn "已保留主 URI 文件；新增入站 URI 写入: $node_uri_file"
+    fi
+    write_all_nginx_config
 
     ok "配置已生成"
     say "配置文件: $CONFIG_FILE"
-    say "普通 URI 文件: $CLIENT_URI_FILE"
-    [ -f "$CLIENT_URI_ECH_FILE" ] && say "ECH URI 文件: $CLIENT_URI_ECH_FILE"
+    say "普通 URI 文件: $node_uri_file"
+    [ -f "$node_ech_uri_file" ] && say "ECH URI 文件: $node_ech_uri_file"
+    [ "$append" -eq 0 ] && say "兼容 URI 文件: $CLIENT_URI_FILE"
     say "协议: $protocol"
     say "传输: $(transport_display_name "$transport")"
     say "端口: $external_port"
@@ -1436,8 +1828,9 @@ configure() {
     fi
     say "服务器: $host"
     [ "$client_host" != "$host" ] && say "连接地址: $client_host"
-    [ "$transport" != "mundordp" ] && say "路径: $path"
+    [ "$transport" != "mundordp" ] && [ "$transport" != "mundosql" ] && say "路径: $path"
     [ "$transport" = "mundordp" ] && say "用户名: $username"
+    [ "$transport" = "mundosql" ] && say "数据库用户名: $username"
     if [ "$CA_ENABLED" = "1" ]; then
         say "认证: MundoCA"
         say "Root CA: $MUNDO_CA_ROOT_CERT_B64_FILE"
@@ -1452,8 +1845,8 @@ configure() {
     else
         say "$token_label: $token"
     fi
-    say "普通 URI: $(cat "$CLIENT_URI_FILE")"
-    [ -f "$CLIENT_URI_ECH_FILE" ] && say "ECH URI: $(cat "$CLIENT_URI_ECH_FILE")"
+    say "普通 URI: $(cat "$node_uri_file")"
+    [ -f "$node_ech_uri_file" ] && say "ECH URI: $(cat "$node_ech_uri_file")"
 
     if [ "$no_restart" -eq 0 ] && systemd_available && systemctl list-unit-files mundoproxy.service >/dev/null 2>&1; then
         systemctl restart mundoproxy
@@ -1607,8 +2000,9 @@ show_info() {
     [ -n "$port" ] && say "端口: $port"
     [ -n "$host" ] && say "服务器: $host"
     [ "$cdn_enabled" = "1" ] && [ -n "$client_host" ] && say "连接地址: $client_host"
-    [ -n "$path_value" ] && [ "$transport" != "mundordp" ] && say "路径: $path_value"
+    [ -n "$path_value" ] && [ "$transport" != "mundordp" ] && [ "$transport" != "mundosql" ] && say "路径: $path_value"
     [ "$transport" = "mundordp" ] && say "用户名: $rdp_username"
+    [ "$transport" = "mundosql" ] && say "数据库用户名: $rdp_username"
     if [ "$ca_enabled" = "1" ]; then
         say "认证: MundoCA"
         [ -n "$ca_public_key" ] && say "客户端公钥 Base64: $ca_public_key"
@@ -1621,6 +2015,38 @@ show_info() {
         say "监听: 0.0.0.0:$core_port"
     fi
     say "配置文件: $CONFIG_FILE"
+    collect_node_files
+    if [ "${#NODE_FILES[@]}" -gt 0 ]; then
+        say ""
+        say "入站列表:"
+        local index=1
+        local file
+        for file in "${NODE_FILES[@]}"; do
+            source_node_profile "$file"
+            say "[$index] $TAG  $PROTOCOL + $(transport_display_name "$TRANSPORT")  $PORT -> $LISTEN_ADDR:$CORE_PORT"
+            [ "$CDN_ENABLED" = "1" ] && say "    连接地址: $CLIENT_HOST"
+            if [ "$TRANSPORT" = "mundordp" ]; then
+                say "    用户名: $RDP_USERNAME"
+            elif [ "$TRANSPORT" = "mundosql" ]; then
+                say "    数据库用户名: $RDP_USERNAME"
+            elif [ -n "$PATH_VALUE" ]; then
+                say "    路径: $PATH_VALUE"
+            fi
+            [ "$REVERSE_PROXY" = "1" ] && say "    反代: Nginx -> 127.0.0.1:$CORE_PORT"
+            [ "$CA_ENABLED" = "1" ] && say "    认证: MundoCA"
+            if [ -f "$NODE_URI_FILE" ]; then
+                say "    普通 URI:"
+                sed 's/^/    /' "$NODE_URI_FILE"
+            fi
+            if [ -f "$NODE_ECH_URI_FILE" ]; then
+                say "    ECH URI:"
+                sed 's/^/    /' "$NODE_ECH_URI_FILE"
+            fi
+            index=$((index + 1))
+        done
+        say ""
+        return 0
+    fi
     if [ -f "$CLIENT_URI_FILE" ]; then
         say ""
         say "普通 URI:"
@@ -1681,6 +2107,8 @@ Mundo Proxy
   mp           菜单
   mp info      显示配置和 URI
   mp config    重新生成配置
+  mp add-node  新增入站
+  mp del-node  删除入站
   mp restart   重启
   mp status    状态
   mp autostart 开关开机启动
@@ -1690,6 +2118,81 @@ Mundo Proxy
 EOF
 }
 
+sync_primary_profile_from_first_node() {
+    collect_node_files
+    [ "${#NODE_FILES[@]}" -gt 0 ] || return 0
+    source_node_profile "${NODE_FILES[0]}"
+    write_profile "$PROTOCOL" "$TRANSPORT" "$CORE_PORT" "$TOKEN" "$HOST" "$CLIENT_HOST" "$PATH_VALUE" "$RDP_USERNAME" "off" "$REVERSE_PROXY" "$PORT" "$CORE_PORT" "$CDN_ENABLED" "$CA_ENABLED" "$MUNDO_CA_CERTIFICATE" "$MUNDO_CA_CLIENT_CERTIFICATE" "$MUNDO_CA_CLIENT_PUBLIC_KEY" "$MUNDO_CA_CLIENT_KEYPAIR_FILE"
+    if [ -f "$NODE_URI_FILE" ]; then
+        cp "$NODE_URI_FILE" "$CLIENT_URI_FILE"
+        chmod 600 "$CLIENT_URI_FILE"
+    fi
+    if [ -f "$NODE_ECH_URI_FILE" ]; then
+        cp "$NODE_ECH_URI_FILE" "$CLIENT_URI_ECH_FILE"
+        chmod 600 "$CLIENT_URI_ECH_FILE"
+    else
+        rm -f "$CLIENT_URI_ECH_FILE"
+    fi
+}
+
+stop_service_quiet() {
+    if systemd_available && systemctl list-unit-files mundoproxy.service >/dev/null 2>&1; then
+        systemctl stop mundoproxy >/dev/null 2>&1 || true
+    elif openrc_available && [ -f "$OPENRC_SERVICE_FILE" ]; then
+        rc-service mundoproxy stop >/dev/null 2>&1 || true
+    fi
+}
+
+restart_service_quiet() {
+    if systemd_available && systemctl list-unit-files mundoproxy.service >/dev/null 2>&1; then
+        systemctl restart mundoproxy >/dev/null 2>&1 || true
+    elif openrc_available && [ -f "$OPENRC_SERVICE_FILE" ]; then
+        rc-service mundoproxy restart >/dev/null 2>&1 || true
+    fi
+}
+
+delete_node() {
+    require_root
+    migrate_profile_to_nodes
+    collect_node_files
+    if [ "${#NODE_FILES[@]}" -eq 0 ]; then
+        warn "没有可删除的入站。"
+        return 0
+    fi
+    say "${blue}删除入站${none}"
+    local index=1
+    local file
+    for file in "${NODE_FILES[@]}"; do
+        source_node_profile "$file"
+        say "  $index) $TAG  $PROTOCOL + $(transport_display_name "$TRANSPORT")  $PORT -> $LISTEN_ADDR:$CORE_PORT"
+        index=$((index + 1))
+    done
+    local choice
+    read -r -p "选择要删除的入站编号 [0取消]: " choice
+    [ -n "$choice" ] || choice=0
+    [[ "$choice" =~ ^[0-9]+$ ]] || { warn "无效编号。"; return 0; }
+    [ "$choice" -gt 0 ] || return 0
+    [ "$choice" -le "${#NODE_FILES[@]}" ] || { warn "无效编号。"; return 0; }
+    local selected="${NODE_FILES[$((choice - 1))]}"
+    source_node_profile "$selected"
+    if [ "${#NODE_FILES[@]}" -eq 1 ]; then
+        warn "这是最后一个入站，删除后会同步停止服务。"
+        yes_no_default_no "确认删除最后一个入站" || return 0
+        rm -f "$selected" "$NODE_URI_FILE" "$NODE_ECH_URI_FILE" "$CONFIG_FILE" "$PROFILE_FILE" "$CLIENT_URI_FILE" "$CLIENT_URI_ECH_FILE"
+        remove_nginx_config
+        stop_service_quiet
+        ok "最后一个入站已删除，服务已停止。"
+        return 0
+    fi
+    yes_no_default_no "确认删除 $TAG" || return 0
+    rm -f "$selected" "$NODE_URI_FILE" "$NODE_ECH_URI_FILE"
+    write_config_from_nodes
+    write_all_nginx_config
+    sync_primary_profile_from_first_node
+    restart_service_quiet
+    ok "入站已删除，配置已重建。"
+}
+
 menu() {
     while true; do
         show_info
@@ -1697,28 +2200,32 @@ menu() {
         say "${blue}菜单${none}"
         say "  1) 显示配置"
         say "  2) 重新配置"
-        say "  3) 重启"
-        say "  4) 状态"
-        say "  5) 开机启动 $(autostart_status_label)"
-        say "  6) 错误日志"
-        say "  7) 卸载"
+        say "  3) 新增入站"
+        say "  4) 删除入站"
+        say "  5) 重启"
+        say "  6) 状态"
+        say "  7) 开机启动 $(autostart_status_label)"
+        say "  8) 错误日志"
+        say "  9) 卸载"
         say "  0) 退出"
         local choice
         read -r -p "请选择 [1]: " choice
         case "${choice:-1}" in
             1) show_info ;;
             2) configure ;;
-            3) restart_service ;;
-            4) status_service ;;
-            5)
+            3) configure --append ;;
+            4) delete_node ;;
+            5) restart_service ;;
+            6) status_service ;;
+            7)
                 if autostart_enabled; then
                     disable_autostart
                 else
                     enable_autostart
                 fi
                 ;;
-            6) show_log "$ERROR_LOG" ;;
-            7) uninstall_mundo_proxy ;;
+            8) show_log "$ERROR_LOG" ;;
+            9) uninstall_mundo_proxy ;;
             0) exit 0 ;;
             *) warn "无效选择。" ;;
         esac
@@ -1743,6 +2250,12 @@ main() {
         config|configure)
             shift
             configure "$@"
+            ;;
+        add-node|add|append)
+            configure --append
+            ;;
+        del-node|delete-node|remove-node)
+            delete_node
             ;;
         start)
             start_service
