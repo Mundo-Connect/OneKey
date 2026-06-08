@@ -74,7 +74,8 @@ service_running() {
     if openrc_available && [ -f "$OPENRC_SERVICE_FILE" ]; then
         rc-service mundoproxy status >/dev/null 2>&1 && return 0
     fi
-    pgrep -f "$CORE_BIN run -c $CONFIG_FILE" >/dev/null 2>&1
+    pgrep -f "$CORE_BIN run -c $CONFIG_FILE" >/dev/null 2>&1 ||
+    pgrep -f "$COMMAND_BIN run" >/dev/null 2>&1
 }
 
 stop_service_if_installed() {
@@ -84,6 +85,7 @@ stop_service_if_installed() {
         rc-service mundoproxy stop >/dev/null 2>&1 || true
     else
         pkill -f "$CORE_BIN run -c $CONFIG_FILE" >/dev/null 2>&1 || true
+        pkill -f "$COMMAND_BIN run" >/dev/null 2>&1 || true
     fi
 }
 
@@ -147,7 +149,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=$CORE_BIN run -c $CONFIG_FILE
+ExecStart=$COMMAND_BIN run
 Restart=on-failure
 RestartSec=3
 LimitNOFILE=1048576
@@ -163,8 +165,8 @@ write_openrc_service() {
 
 name="Mundo Proxy"
 description="Mundo Proxy"
-command="$CORE_BIN"
-command_args="run -c $CONFIG_FILE"
+command="$COMMAND_BIN"
+command_args="run"
 command_background="yes"
 pidfile="/run/mundoproxy.pid"
 output_log="$LOG_DIR/service.log"
@@ -222,7 +224,7 @@ enable_service() {
             rc-service mundoproxy stop >/dev/null 2>&1 || true
         fi
     else
-        warn "未检测到 systemd 或 OpenRC，请手动运行：mundoproxy run -c $CONFIG_FILE"
+        warn "未检测到 systemd 或 OpenRC，请手动运行：mp run"
     fi
 }
 
@@ -306,6 +308,12 @@ main() {
         warn "更新模式保留配置文件: $CONFIG_FILE"
     elif [ ! -s "$CONFIG_FILE" ]; then
         "$SH_DIR/src/init.sh" config --no-restart
+        if [ -t 0 ]; then
+            read -r -p "是否现在配置 TCP Brutal / Mundo X Brutal? [y/N]: " brutal_answer
+            case "$brutal_answer" in
+                y|Y|yes|YES) "$SH_DIR/src/init.sh" brutal ;;
+            esac
+        fi
     else
         warn "已存在配置文件: $CONFIG_FILE"
         read -r -p "是否重新生成配置? [y/N]: " answer

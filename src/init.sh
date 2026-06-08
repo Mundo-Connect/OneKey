@@ -32,6 +32,12 @@ PROFILE_FILE="$APP_DIR/profile.env"
 NODE_DIR="$APP_DIR/nodes"
 URI_DIR="$APP_DIR/uris"
 NGINX_CONF_FILE="/etc/nginx/conf.d/mundoproxy.conf"
+BRUTAL_PROFILE_FILE="$APP_DIR/brutal.env"
+TCP_BRUTAL_URL="${TCP_BRUTAL_URL:-https://tcp.hy2.sh/}"
+TCP_BRUTAL_REPO="${TCP_BRUTAL_REPO:-https://github.com/apernet/tcp-brutal.git}"
+TCP_BRUTAL_SRC_DIR="${TCP_BRUTAL_SRC_DIR:-/usr/local/src/tcp-brutal}"
+MUNDO_BRUTAL_REPO="${MUNDO_BRUTAL_REPO:-https://github.com/Mundo-Connect/Mundo-Brutal.git}"
+MUNDO_BRUTAL_SRC_DIR="${MUNDO_BRUTAL_SRC_DIR:-/usr/local/src/mundo-brutal}"
 
 red='\033[31m'
 yellow='\033[33m'
@@ -117,6 +123,199 @@ install_certbot() {
             ;;
     esac
     command -v certbot >/dev/null 2>&1
+}
+
+kernel_headers_ready() {
+    local rel
+    rel="$(uname -r)"
+    [ -e "/lib/modules/$rel/build/Makefile" ] ||
+    [ -d "/usr/src/kernels/$rel" ] ||
+    [ -d "/usr/src/linux-headers-$rel" ]
+}
+
+apt_install_one_of() {
+    local pkg
+    for pkg in "$@"; do
+        DEBIAN_FRONTEND=noninteractive apt-get install -y "$pkg" && return 0
+    done
+    return 1
+}
+
+ensure_kernel_headers() {
+    kernel_headers_ready && return 0
+    local manager rel
+    manager="$(detect_pkg_manager)"
+    rel="$(uname -r)"
+    warn "未检测到当前内核 headers/build 目录，尝试安装: $rel"
+    case "$manager" in
+        apt)
+            apt-get update -y || true
+            apt_install_one_of "linux-headers-$rel" linux-headers-amd64 linux-headers-generic || true
+            ;;
+        dnf)
+            dnf install -y "kernel-devel-$rel" kernel-headers || dnf install -y kernel-devel kernel-headers || true
+            ;;
+        yum)
+            yum install -y "kernel-devel-$rel" kernel-headers || yum install -y kernel-devel kernel-headers || true
+            ;;
+        apk)
+            apk add --no-cache linux-headers "$(alpine_kernel_dev_package)" || true
+            ;;
+    esac
+    kernel_headers_ready
+}
+
+alpine_kernel_dev_package() {
+    local rel flavor
+    rel="$(uname -r)"
+    flavor="${rel##*-}"
+    [ -n "$flavor" ] && [ "$flavor" != "$rel" ] || flavor="lts"
+    printf "linux-%s-dev" "$flavor"
+}
+
+install_alpine_build_deps() {
+    apk add --no-cache git make clang kmod linux-headers musl-dev "$(alpine_kernel_dev_package)" ||
+    apk add --no-cache git make clang kmod linux-headers musl-dev
+}
+
+update_git_source() {
+    local repo="$1"
+    local dir="$2"
+    if [ -d "$dir/.git" ]; then
+        git -C "$dir" pull --ff-only
+        return $?
+    fi
+    mkdir -p "$(dirname "$dir")"
+    git clone --depth 1 "$repo" "$dir"
+}
+
+install_module_from_source() {
+    local dir="$1"
+    local module module_name target_dir
+    make -C "$dir" clean >/dev/null 2>&1 || true
+    make -C "$dir" || return 1
+    make -C "$dir" install || {
+        module="$(find "$dir" -type f -name '*.ko' 2>/dev/null | head -n 1)"
+        [ -n "$module" ] || return 1
+        target_dir="/lib/modules/$(uname -r)/extra"
+        mkdir -p "$target_dir"
+        install -m 644 "$module" "$target_dir/$(basename "$module")"
+    }
+    depmod -a 2>/dev/null || true
+    module="$(find "$dir" "/lib/modules/$(uname -r)" -type f -name '*.ko*' 2>/dev/null | head -n 1)"
+    [ -n "$module" ] || return 1
+    module_name="$(basename "$module")"
+    module_name="${module_name%%.ko*}"
+    mkdir -p /etc/modules-load.d
+    echo "$module_name" > "/etc/modules-load.d/$module_name.conf"
+    touch /etc/modules
+    grep -qxF "$module_name" /etc/modules || echo "$module_name" >> /etc/modules
+    modprobe "$module_name" 2>/dev/null || insmod "$module" 2>/dev/null || true
+}
+
+install_mundo_brutal() {
+    local manager
+    manager="$(detect_pkg_manager)"
+    if [ "$manager" = "apk" ]; then
+        install_alpine_build_deps || return 1
+    else
+        ensure_kernel_headers || return 1
+        command -v git >/dev/null 2>&1 || case "$manager" in
+            apt) apt-get update -y && DEBIAN_FRONTEND=noninteractive apt-get install -y git ;;
+            dnf) dnf install -y git ;;
+            yum) yum install -y git ;;
+        esac
+        command -v make >/dev/null 2>&1 || case "$manager" in
+            apt) DEBIAN_FRONTEND=noninteractive apt-get install -y make gcc ;;
+            dnf) dnf install -y make gcc ;;
+            yum) yum install -y make gcc ;;
+        esac
+    fi
+    update_git_source "$MUNDO_BRUTAL_REPO" "$MUNDO_BRUTAL_SRC_DIR" &&
+    install_module_from_source "$MUNDO_BRUTAL_SRC_DIR"
+}
+
+install_tcp_brutal() {
+    local manager
+    manager="$(detect_pkg_manager)"
+    if [ "$manager" = "apk" ]; then
+        install_alpine_build_deps &&
+        update_git_source "$TCP_BRUTAL_REPO" "$TCP_BRUTAL_SRC_DIR" &&
+        install_module_from_source "$TCP_BRUTAL_SRC_DIR"
+        return $?
+    fi
+    ensure_kernel_headers || return 1
+    command -v curl >/dev/null 2>&1 || case "$manager" in
+        apt) apt-get update -y && DEBIAN_FRONTEND=noninteractive apt-get install -y curl ;;
+        dnf) dnf install -y curl ;;
+        yum) yum install -y curl ;;
+    esac
+    bash <(curl -fsSL "$TCP_BRUTAL_URL")
+}
+
+write_brutal_profile() {
+    local enabled="$1"
+    local mbps="$2"
+    mkdir -p "$APP_DIR"
+    cat > "$BRUTAL_PROFILE_FILE" <<EOF
+BRUTAL_ENABLED='$enabled'
+BRUTAL_MBPS='$mbps'
+EOF
+    chmod 600 "$BRUTAL_PROFILE_FILE"
+}
+
+load_brutal_profile() {
+    BRUTAL_ENABLED=0
+    BRUTAL_MBPS=100
+    [ -f "$BRUTAL_PROFILE_FILE" ] && . "$BRUTAL_PROFILE_FILE"
+}
+
+core_brutal_args() {
+    load_brutal_profile
+    [ "${BRUTAL_ENABLED:-0}" = "1" ] || return 0
+    printf " -brutal %s" "${BRUTAL_MBPS:-100}"
+}
+
+configure_brutal() {
+    require_root
+    say "${blue}Brutal 配置${none}"
+    say "  1) 安装 Mundo X Brutal 并启用"
+    say "  2) 安装 TCP Brutal 并启用"
+    say "  3) 只启用核心 brutal 参数"
+    say "  4) 禁用"
+    say "  0) 取消"
+    local choice mbps
+    read -r -p "请选择 [1]: " choice
+    choice="${choice:-1}"
+    case "$choice" in
+        1)
+            install_mundo_brutal || warn "Mundo X Brutal 安装失败，仍会保存配置，核心启动时会探测，不支持则自动禁用。"
+            ;;
+        2)
+            install_tcp_brutal || warn "TCP Brutal 安装失败，仍会保存配置，核心启动时会探测，不支持则自动禁用。"
+            ;;
+        3)
+            ;;
+        4)
+            write_brutal_profile 0 100
+            ok "Brutal 已禁用。"
+            restart_service_quiet
+            return 0
+            ;;
+        0)
+            return 0
+            ;;
+        *)
+            warn "无效选择。"
+            return 0
+            ;;
+    esac
+    mbps="$(prompt_default "速率 Mbps" "100")"
+    [[ "$mbps" =~ ^[0-9]+$ ]] || err "Mbps 必须是数字。"
+    [ "$mbps" -gt 0 ] || mbps=100
+    write_brutal_profile 1 "$mbps"
+    ok "Brutal 已启用: ${mbps}Mbps。核心启动时会自动探测 mundo/brutal，支持才生效。"
+    restart_service_quiet
 }
 
 prompt_default() {
@@ -1944,7 +2143,7 @@ status_service() {
     else
         warn "未安装服务。"
         if [ -x "$CORE_BIN" ]; then
-            say "可手动运行: mundoproxy run -c $CONFIG_FILE"
+            say "可手动运行: mp run"
         fi
     fi
 }
@@ -2088,6 +2287,10 @@ uninstall_mundo_proxy() {
 
 run_core() {
     [ -x "$CORE_BIN" ] || err "内核不存在: $CORE_BIN"
+    load_brutal_profile
+    if [ "${BRUTAL_ENABLED:-0}" = "1" ]; then
+        exec "$CORE_BIN" run -c "$CONFIG_FILE" -brutal "${BRUTAL_MBPS:-100}"
+    fi
     exec "$CORE_BIN" run -c "$CONFIG_FILE"
 }
 
@@ -2109,6 +2312,7 @@ Mundo Proxy
   mp config    重新生成配置
   mp add-node  新增入站
   mp del-node  删除入站
+  mp brutal    配置 TCP Brutal / Mundo X Brutal
   mp restart   重启
   mp status    状态
   mp autostart 开关开机启动
@@ -2205,8 +2409,9 @@ menu() {
         say "  5) 重启"
         say "  6) 状态"
         say "  7) 开机启动 $(autostart_status_label)"
-        say "  8) 错误日志"
-        say "  9) 卸载"
+        say "  8) Brutal 配置"
+        say "  9) 错误日志"
+        say " 10) 卸载"
         say "  0) 退出"
         local choice
         read -r -p "请选择 [1]: " choice
@@ -2224,8 +2429,9 @@ menu() {
                     enable_autostart
                 fi
                 ;;
-            8) show_log "$ERROR_LOG" ;;
-            9) uninstall_mundo_proxy ;;
+            8) configure_brutal ;;
+            9) show_log "$ERROR_LOG" ;;
+            10) uninstall_mundo_proxy ;;
             0) exit 0 ;;
             *) warn "无效选择。" ;;
         esac
@@ -2256,6 +2462,9 @@ main() {
             ;;
         del-node|delete-node|remove-node)
             delete_node
+            ;;
+        brutal)
+            configure_brutal
             ;;
         start)
             start_service
