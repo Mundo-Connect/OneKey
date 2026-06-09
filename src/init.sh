@@ -33,6 +33,7 @@ NODE_DIR="$APP_DIR/nodes"
 URI_DIR="$APP_DIR/uris"
 NGINX_CONF_FILE="/etc/nginx/conf.d/mundoproxy.conf"
 BRUTAL_PROFILE_FILE="$APP_DIR/brutal.env"
+BRUTAL_DEFAULT_MBPS=1000
 TCP_BRUTAL_URL="${TCP_BRUTAL_URL:-https://tcp.hy2.sh/}"
 TCP_BRUTAL_REPO="${TCP_BRUTAL_REPO:-https://github.com/apernet/tcp-brutal.git}"
 TCP_BRUTAL_SRC_DIR="${TCP_BRUTAL_SRC_DIR:-/usr/local/src/tcp-brutal}"
@@ -178,6 +179,33 @@ install_alpine_build_deps() {
     apk add --no-cache git make clang kmod linux-headers musl-dev
 }
 
+module_loaded() {
+    local name="${1//-/_}"
+    [ -n "$name" ] || return 1
+    [ -d "/sys/module/$name" ] && return 0
+    [ -r /proc/modules ] && grep -q "^$name[[:space:]]" /proc/modules
+}
+
+find_kernel_module() {
+    local dir="$1"
+    local name="${2:-}"
+    if [ -n "$name" ]; then
+        find "$dir" -type f -name "$name.ko*" 2>/dev/null | head -n 1
+        return
+    fi
+    find "$dir" -type f -name '*.ko*' 2>/dev/null | head -n 1
+}
+
+load_kernel_module() {
+    local name="$1"
+    local module="${2:-}"
+    local module_name="${name//-/_}"
+    [ -n "$module_name" ] || return 1
+    module_loaded "$module_name" && return 0
+    modprobe "$module_name" 2>/dev/null || { [ -n "$module" ] && insmod "$module" 2>/dev/null; } || return 1
+    module_loaded "$module_name"
+}
+
 update_git_source() {
     local repo="$1"
     local dir="$2"
@@ -191,26 +219,26 @@ update_git_source() {
 
 install_module_from_source() {
     local dir="$1"
+    local expected="${2:-}"
     local module module_name target_dir
     make -C "$dir" clean >/dev/null 2>&1 || true
     make -C "$dir" || return 1
+    module="$(find_kernel_module "$dir" "$expected")"
+    [ -n "$module" ] || return 1
     make -C "$dir" install || {
-        module="$(find "$dir" -type f -name '*.ko' 2>/dev/null | head -n 1)"
-        [ -n "$module" ] || return 1
         target_dir="/lib/modules/$(uname -r)/extra"
         mkdir -p "$target_dir"
         install -m 644 "$module" "$target_dir/$(basename "$module")"
     }
     depmod -a 2>/dev/null || true
-    module="$(find "$dir" "/lib/modules/$(uname -r)" -type f -name '*.ko*' 2>/dev/null | head -n 1)"
-    [ -n "$module" ] || return 1
-    module_name="$(basename "$module")"
+    module_name="${expected:-$(basename "$module")}"
     module_name="${module_name%%.ko*}"
+    module_name="${module_name//-/_}"
     mkdir -p /etc/modules-load.d
     echo "$module_name" > "/etc/modules-load.d/$module_name.conf"
     touch /etc/modules
     grep -qxF "$module_name" /etc/modules || echo "$module_name" >> /etc/modules
-    modprobe "$module_name" 2>/dev/null || insmod "$module" 2>/dev/null || true
+    load_kernel_module "$module_name" "$module"
 }
 
 install_mundo_brutal() {
@@ -232,7 +260,7 @@ install_mundo_brutal() {
         esac
     fi
     update_git_source "$MUNDO_BRUTAL_REPO" "$MUNDO_BRUTAL_SRC_DIR" &&
-    install_module_from_source "$MUNDO_BRUTAL_SRC_DIR"
+    install_module_from_source "$MUNDO_BRUTAL_SRC_DIR" mundo
 }
 
 install_tcp_brutal() {
@@ -241,7 +269,7 @@ install_tcp_brutal() {
     if [ "$manager" = "apk" ]; then
         install_alpine_build_deps &&
         update_git_source "$TCP_BRUTAL_REPO" "$TCP_BRUTAL_SRC_DIR" &&
-        install_module_from_source "$TCP_BRUTAL_SRC_DIR"
+        install_module_from_source "$TCP_BRUTAL_SRC_DIR" brutal
         return $?
     fi
     ensure_kernel_headers || return 1
@@ -250,71 +278,87 @@ install_tcp_brutal() {
         dnf) dnf install -y curl ;;
         yum) yum install -y curl ;;
     esac
-    bash <(curl -fsSL "$TCP_BRUTAL_URL")
+    bash <(curl -fsSL "$TCP_BRUTAL_URL") || return 1
+    load_kernel_module brutal
 }
 
 write_brutal_profile() {
     local enabled="$1"
     local mbps="$2"
+    local module="${3:-}"
     mkdir -p "$APP_DIR"
     cat > "$BRUTAL_PROFILE_FILE" <<EOF
 BRUTAL_ENABLED='$enabled'
 BRUTAL_MBPS='$mbps'
+BRUTAL_MODULE='$module'
 EOF
     chmod 600 "$BRUTAL_PROFILE_FILE"
 }
 
 load_brutal_profile() {
     BRUTAL_ENABLED=0
-    BRUTAL_MBPS=100
+    BRUTAL_MBPS=$BRUTAL_DEFAULT_MBPS
+    BRUTAL_MODULE=
     [ -f "$BRUTAL_PROFILE_FILE" ] && . "$BRUTAL_PROFILE_FILE"
 }
 
 core_brutal_args() {
     load_brutal_profile
     [ "${BRUTAL_ENABLED:-0}" = "1" ] || return 0
-    printf " -brutal %s" "${BRUTAL_MBPS:-100}"
+    printf " -brutal %s" "${BRUTAL_MBPS:-$BRUTAL_DEFAULT_MBPS}"
 }
 
 configure_brutal() {
     require_root
+    load_brutal_profile
     say "${blue}Brutal 配置${none}"
-    say "  1) 安装 Mundo X Brutal 并启用"
-    say "  2) 安装 TCP Brutal 并启用"
-    say "  3) 只启用核心 brutal 参数"
-    say "  4) 禁用"
-    say "  0) 取消"
-    local choice mbps
-    read -r -p "请选择 [1]: " choice
-    choice="${choice:-1}"
-    case "$choice" in
-        1)
-            install_mundo_brutal || warn "Mundo X Brutal 安装失败，仍会保存配置，核心启动时会探测，不支持则自动禁用。"
-            ;;
-        2)
-            install_tcp_brutal || warn "TCP Brutal 安装失败，仍会保存配置，核心启动时会探测，不支持则自动禁用。"
-            ;;
-        3)
-            ;;
-        4)
-            write_brutal_profile 0 100
+    if [ "${BRUTAL_ENABLED:-0}" = "1" ]; then
+        say "当前已启用: ${BRUTAL_MBPS:-$BRUTAL_DEFAULT_MBPS}Mbps ${BRUTAL_MODULE:+($BRUTAL_MODULE)}"
+        if yes_no_default_no "是否禁用 Brutal?"; then
+            write_brutal_profile 0 "$BRUTAL_DEFAULT_MBPS"
             ok "Brutal 已禁用。"
             restart_service_quiet
             return 0
-            ;;
-        0)
+        fi
+        yes_no_default_no "是否重新安装或调整速率?" || return 0
+    else
+        say "当前未启用。"
+        if ! yes_no_default_no "是否启用 Brutal?"; then
+            write_brutal_profile 0 "$BRUTAL_DEFAULT_MBPS"
+            ok "Brutal 保持禁用。"
             return 0
-            ;;
-        *)
-            warn "无效选择。"
-            return 0
-            ;;
-    esac
-    mbps="$(prompt_default "速率 Mbps" "100")"
+        fi
+    fi
+
+    local mbps module
+    say "优先安装 Mundo X Brutal..."
+    if install_mundo_brutal; then
+        module=mundo
+        ok "Mundo X Brutal 模块已加载。"
+    else
+        warn "Mundo X Brutal 未成功加载。"
+        if yes_no_default_no "是否尝试安装 TCP Brutal?"; then
+            if install_tcp_brutal; then
+                module=brutal
+                ok "TCP Brutal 模块已加载。"
+            else
+                warn "TCP Brutal 未成功加载。"
+            fi
+        fi
+    fi
+
+    if [ -z "$module" ]; then
+        write_brutal_profile 0 "$BRUTAL_DEFAULT_MBPS"
+        warn "未检测到已加载的 Brutal 模块，保持禁用。"
+        restart_service_quiet
+        return 0
+    fi
+
+    mbps="$(prompt_default "速率 Mbps" "$BRUTAL_DEFAULT_MBPS")"
     [[ "$mbps" =~ ^[0-9]+$ ]] || err "Mbps 必须是数字。"
-    [ "$mbps" -gt 0 ] || mbps=100
-    write_brutal_profile 1 "$mbps"
-    ok "Brutal 已启用: ${mbps}Mbps。核心启动时会自动探测 mundo/brutal，支持才生效。"
+    [ "$mbps" -gt 0 ] || mbps=$BRUTAL_DEFAULT_MBPS
+    write_brutal_profile 1 "$mbps" "$module"
+    ok "Brutal 已启用: ${mbps}Mbps ($module)。"
     restart_service_quiet
 }
 
@@ -2289,7 +2333,7 @@ run_core() {
     [ -x "$CORE_BIN" ] || err "内核不存在: $CORE_BIN"
     load_brutal_profile
     if [ "${BRUTAL_ENABLED:-0}" = "1" ]; then
-        exec "$CORE_BIN" run -c "$CONFIG_FILE" -brutal "${BRUTAL_MBPS:-100}"
+        exec "$CORE_BIN" run -c "$CONFIG_FILE" -brutal "${BRUTAL_MBPS:-$BRUTAL_DEFAULT_MBPS}"
     fi
     exec "$CORE_BIN" run -c "$CONFIG_FILE"
 }

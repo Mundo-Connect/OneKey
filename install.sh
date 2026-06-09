@@ -309,7 +309,7 @@ main() {
     elif [ ! -s "$CONFIG_FILE" ]; then
         "$SH_DIR/src/init.sh" config --no-restart
         if [ -t 0 ]; then
-            read -r -p "是否现在配置 TCP Brutal / Mundo X Brutal? [y/N]: " brutal_answer
+            read -r -p "是否现在启用 Brutal? [y/N]: " brutal_answer
             case "$brutal_answer" in
                 y|Y|yes|YES) "$SH_DIR/src/init.sh" brutal ;;
             esac
