@@ -638,15 +638,15 @@ choose_mundo_ca_auth() {
 
     say ""
     say "${cyan}认证方式${none}"
-    say "默认使用 UUID/token/password。启用 MundoCA 后，节点只校验证书，不再使用 UUID/token/password 作为用户认证。"
-    if ! yes_no_default_no "启用 MundoCA 证书式认证"; then
+        say "默认使用令牌/密码认证。启用 MundoCA 证书认证后，节点只校验证书，不再使用令牌/密码作为用户认证。"
+        if ! yes_no_default_no "是否启用 MundoCA 证书认证（更安全，无需记忆令牌）"; then
         return 0
     fi
 
     CA_ENABLED=1
     ensure_mundo_ca_root
 
-    if yes_no_default_yes "一键生成客户端 SM2 公私钥和证书"; then
+        if yes_no_default_no "是否自动生成客户端 SM2 密钥和证书（推荐）"; then
         generate_sm2_client_key
         local private_hex public_hex
         private_hex="$(extract_sm2_private_hex "$MUNDO_CA_CLIENT_KEY_FILE")"
@@ -906,7 +906,7 @@ choose_protocol_transport() {
     say "  vless (VLESS)"
     say "  vmess (VMess)"
     say "  anytls (AnyTLS)"
-    say "传输:"
+    say "传输（回车默认: mundordp — 推荐）:"
     say "  ${green}mundordp (Mundo Connect RDP Protocol，所有协议支持)${none}"
     say "  ${green}mc1 (Mundo Connect 1，所有协议支持，CDN)${none}"
     say "  xhttp (XHTTP，仅 mx，CDN)"
@@ -914,7 +914,7 @@ choose_protocol_transport() {
     say "  ws (WebSocket，仅 mx，CDN)"
     say "  mundosql (MundoSQL，仅 mx，默认端口 3306)"
     local choice
-    read -r -p "协议+传输 [mx+mundordp]: " choice
+    read -r -p "协议+传输（直接回车使用默认）[mx+mundordp]: " choice
     parse_protocol_transport "$choice" || err "不支持的协议或传输。"
 }
 
@@ -2081,7 +2081,7 @@ configure() {
         [ -n "$CLIENT_PUBLIC_KEY_B64" ] && say "客户端公钥 Base64: $CLIENT_PUBLIC_KEY_B64"
         if [ "$CLIENT_KEYPAIR_GENERATED" = "1" ]; then
             say ""
-            say "${yellow}请立即保存以下客户端密钥对。格式为 Base64(privateKey[32] || publicKey[65])。${none}"
+            say "${yellow}请妥善保存以下客户端密钥对（切勿泄露私钥）。格式: Base64(私钥32字节 || 公钥65字节)${none}"
             say "$CLIENT_KEYPAIR_B64"
             say "密钥对文件: $MUNDO_CA_CLIENT_KEYPAIR_FILE"
         fi
@@ -2306,7 +2306,7 @@ show_info() {
 uninstall_mundo_proxy() {
     require_root
     warn "即将卸载 Mundo Proxy，并删除 $APP_DIR 与 $LOG_DIR。"
-    read -r -p "确认卸载? [y/N]: " answer
+    read -r -p "确认卸载 Mundo Proxy（将删除所有数据和配置）[y/N]: " answer
     case "$answer" in
         y|Y|yes|YES) ;;
         *) say "已取消。"; exit 0 ;;
@@ -2354,10 +2354,10 @@ Mundo Proxy
   mp           菜单
   mp info      显示配置和 URI
   mp config    重新生成配置
-  mp add-node  新增入站
+  mp add-node  新增入站节点
   mp del-node  删除入站
   mp brutal    配置 TCP Brutal / Mundo X Brutal
-  mp restart   重启
+  mp restart   重启服务（使配置生效）
   mp status    状态
   mp autostart 开关开机启动
   mp log       日志
@@ -2416,7 +2416,23 @@ delete_node() {
         index=$((index + 1))
     done
     local choice
-    read -r -p "选择要删除的入站编号 [0取消]: " choice
+    read -r -p "选择要删除的入站编号 [0取消，00 全部删除]: " choice
+
+    [ -n "$choice" ] || choice=0
+    if [ "$choice" = "00" ]; then
+        warn "即将删除全部 ${#NODE_FILES[@]} 个入站并停止服务。"
+        yes_no_default_no "确认全部删除" || return 0
+        local del_file
+        for del_file in "${NODE_FILES[@]}"; do
+            source_node_profile "$del_file"
+            rm -f "$del_file" "$NODE_URI_FILE" "$NODE_ECH_URI_FILE"
+        done
+        rm -f "$CONFIG_FILE" "$PROFILE_FILE" "$CLIENT_URI_FILE" "$CLIENT_URI_ECH_FILE"
+        remove_nginx_config
+        stop_service_quiet
+        ok "全部入站已删除，服务已停止。"
+        return 0
+    fi
     [ -n "$choice" ] || choice=0
     [[ "$choice" =~ ^[0-9]+$ ]] || { warn "无效编号。"; return 0; }
     [ "$choice" -gt 0 ] || return 0
@@ -2443,6 +2459,14 @@ delete_node() {
 
 menu() {
     while true; do
+        migrate_profile_to_nodes
+        collect_node_files
+        if [ "${#NODE_FILES[@]}" -eq 0 ]; then
+            say ""
+            say "${yellow}当前没有任何入站节点，请先创建第一个。${none}"
+            configure
+            continue
+        fi
         show_info
         say ""
         say "${blue}菜单${none}"
