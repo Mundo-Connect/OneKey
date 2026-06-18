@@ -314,16 +314,16 @@ configure_brutal() {
     say "${blue}Brutal 配置${none}"
     if [ "${BRUTAL_ENABLED:-0}" = "1" ]; then
         say "当前已启用: ${BRUTAL_MBPS:-$BRUTAL_DEFAULT_MBPS}Mbps ${BRUTAL_MODULE:+($BRUTAL_MODULE)}"
-        if yes_no_default_no "是否禁用 Brutal?"; then
+        if yes_no_default_no "是否禁用 Brutal（回车默认不操作）"; then
             write_brutal_profile 0 "$BRUTAL_DEFAULT_MBPS"
             ok "Brutal 已禁用。"
             restart_service_quiet
             return 0
         fi
-        yes_no_default_no "是否重新安装或调整速率?" || return 0
+        yes_no_default_no "是否重新安装或调整速率（回车默认不操作）" || return 0
     else
         say "当前未启用。"
-        if ! yes_no_default_no "是否启用 Brutal?"; then
+        if ! yes_no_default_no "是否启用 Brutal（回车默认不启用）"; then
             write_brutal_profile 0 "$BRUTAL_DEFAULT_MBPS"
             ok "Brutal 保持禁用。"
             return 0
@@ -337,7 +337,7 @@ configure_brutal() {
         ok "Mundo X Brutal 模块已加载。"
     else
         warn "Mundo X Brutal 未成功加载。"
-        if yes_no_default_no "是否尝试安装 TCP Brutal?"; then
+        if yes_no_default_no "是否尝试安装 TCP Brutal（回车默认不安装）"; then
             if install_tcp_brutal; then
                 module=brutal
                 ok "TCP Brutal 模块已加载。"
@@ -639,14 +639,14 @@ choose_mundo_ca_auth() {
     say ""
     say "${cyan}认证方式${none}"
         say "默认使用令牌/密码认证。启用 MundoCA 证书认证后，节点只校验证书，不再使用令牌/密码作为用户认证。"
-        if ! yes_no_default_no "是否启用 MundoCA 证书认证（更安全，无需记忆令牌）"; then
+        if ! yes_no_default_no "是否启用 MundoCA 证书认证（更安全，无需记忆令牌，回车默认不启用）"; then
         return 0
     fi
 
     CA_ENABLED=1
     ensure_mundo_ca_root
 
-        if yes_no_default_no "是否自动生成客户端 SM2 密钥和证书（推荐）"; then
+        if yes_no_default_no "是否自动生成客户端 SM2 密钥和证书（推荐自动生成，回车默认不生成，手动输入公钥）"; then
         generate_sm2_client_key
         local private_hex public_hex
         private_hex="$(extract_sm2_private_hex "$MUNDO_CA_CLIENT_KEY_FILE")"
@@ -936,7 +936,7 @@ choose_cdn_address() {
     local default_host="$2"
     CLIENT_HOST="$default_host"
     CDN_ENABLED=0
-    if cdn_capable_transport "$transport" && yes_no_default_no "使用 CDN 优选地址"; then
+    if cdn_capable_transport "$transport" && yes_no_default_no "是否使用 CDN 优选地址（回车默认使用服务器地址直连）"; then
         CLIENT_HOST="$(prompt_default "CDN 优选地址" "$default_host")"
         CLIENT_HOST="$(sanitize_host "$CLIENT_HOST")"
         [ -n "$CLIENT_HOST" ] || CLIENT_HOST="$default_host"
@@ -992,7 +992,7 @@ try_certbot_cert() {
 
 prepare_certificate() {
     local host="$1"
-    if is_domain_name "$host" && yes_no_default_no "使用 certbot 申请证书（需要 80 端口）"; then
+    if is_domain_name "$host" && yes_no_default_no "是否使用 certbot 申请可信证书（需要 80 端口可用，回车默认使用自签名证书）"; then
         if try_certbot_cert "$host"; then
             ok "已使用 certbot 证书。"
             return 0
@@ -2014,10 +2014,10 @@ configure() {
         fi
         if [ "$external_port" != "443" ]; then
             warn "当前端口不是 443。"
-            if yes_no_default_no "启用 Nginx 反代"; then
+            if yes_no_default_no "是否启用 Nginx 反代（回车默认不启用，直接监听端口）"; then
                 reverse_proxy=1
             fi
-        elif yes_no_default_no "启用 Nginx 反代"; then
+        elif yes_no_default_no "是否启用 Nginx 反代（回车默认不启用，直接监听端口）"; then
             reverse_proxy=1
         fi
     fi
@@ -2306,7 +2306,7 @@ show_info() {
 uninstall_mundo_proxy() {
     require_root
     warn "即将卸载 Mundo Proxy，并删除 $APP_DIR 与 $LOG_DIR。"
-    read -r -p "确认卸载 Mundo Proxy（将删除所有数据和配置）[y/N]: " answer
+    read -r -p "确认卸载 Mundo Proxy（将删除所有数据和配置，回车默认取消）[y/N]: " answer
     case "$answer" in
         y|Y|yes|YES) ;;
         *) say "已取消。"; exit 0 ;;
@@ -2421,7 +2421,7 @@ delete_node() {
     [ -n "$choice" ] || choice=0
     if [ "$choice" = "00" ]; then
         warn "即将删除全部 ${#NODE_FILES[@]} 个入站并停止服务。"
-        yes_no_default_no "确认全部删除" || return 0
+        yes_no_default_no "确认删除全部入站（回车默认取消，不删除）" || return 0
         local del_file
         for del_file in "${NODE_FILES[@]}"; do
             source_node_profile "$del_file"
@@ -2441,14 +2441,14 @@ delete_node() {
     source_node_profile "$selected"
     if [ "${#NODE_FILES[@]}" -eq 1 ]; then
         warn "这是最后一个入站，删除后会同步停止服务。"
-        yes_no_default_no "确认删除最后一个入站" || return 0
+        yes_no_default_no "确认删除最后一个入站（回车默认取消，不删除）" || return 0
         rm -f "$selected" "$NODE_URI_FILE" "$NODE_ECH_URI_FILE" "$CONFIG_FILE" "$PROFILE_FILE" "$CLIENT_URI_FILE" "$CLIENT_URI_ECH_FILE"
         remove_nginx_config
         stop_service_quiet
         ok "最后一个入站已删除，服务已停止。"
         return 0
     fi
-    yes_no_default_no "确认删除 $TAG" || return 0
+    yes_no_default_no "确认删除 $TAG（回车默认取消，不删除）" || return 0
     rm -f "$selected" "$NODE_URI_FILE" "$NODE_ECH_URI_FILE"
     write_config_from_nodes
     write_all_nginx_config
