@@ -7,6 +7,7 @@ APP_DIR="/etc/mundoproxy"
 BIN_DIR="$APP_DIR/bin"
 SH_DIR="$APP_DIR/sh"
 CONFIG_FILE="$APP_DIR/config.json"
+NODE_DIR="$APP_DIR/nodes"
 LOG_DIR="/var/log/mundoproxy"
 SERVICE_FILE="/etc/systemd/system/mundoproxy.service"
 OPENRC_SERVICE_FILE="/etc/init.d/mundoproxy"
@@ -106,6 +107,7 @@ detect_pkg_manager() {
 install_dependencies() {
     local missing=""
     command -v openssl >/dev/null 2>&1 || missing="$missing openssl"
+    command -v ip >/dev/null 2>&1 || missing="$missing iproute"
     if command -v update-ca-certificates >/dev/null 2>&1 || command -v trust >/dev/null 2>&1; then
         :
     else
@@ -118,26 +120,27 @@ install_dependencies() {
 
     local manager
     manager="$(detect_pkg_manager)"
-    [ -n "$manager" ] || err "无法识别包管理器，请手动安装: openssl ca-certificates"
+    [ -n "$manager" ] || err "无法识别包管理器，请手动安装: openssl ca-certificates iproute2/iproute"
 
     warn "安装依赖:$missing"
     case "$manager" in
         apt)
             apt-get update -y
-            DEBIAN_FRONTEND=noninteractive apt-get install -y openssl ca-certificates
+            DEBIAN_FRONTEND=noninteractive apt-get install -y openssl ca-certificates iproute2
             ;;
         dnf)
-            dnf install -y openssl ca-certificates
+            dnf install -y openssl ca-certificates iproute
             ;;
         yum)
-            yum install -y openssl ca-certificates
+            yum install -y openssl ca-certificates iproute
             ;;
         apk)
-            apk add --no-cache openssl ca-certificates
+            apk add --no-cache openssl ca-certificates iproute2
             ;;
     esac
 
     command -v openssl >/dev/null 2>&1 || err "openssl 安装失败。"
+    command -v ip >/dev/null 2>&1 || err "iproute 安装失败。"
 }
 
 write_service() {
@@ -228,26 +231,53 @@ enable_service() {
     fi
 }
 
+nodes_exist() {
+    [ -d "$NODE_DIR" ] && find "$NODE_DIR" -type f -name '*.env' -print -quit 2>/dev/null | grep -q .
+}
+
+first_run_config() {
+    say "首次安装：按回车会自动安装并输出可直接使用的 URI；输入 n 可手动配置。"
+    if [ -t 0 ]; then
+        local answer
+        read -r -p "是否自动安装？[Y/n]: " answer
+        case "$answer" in
+            n|N|no|NO)
+                "$SH_DIR/src/init.sh" config --no-restart
+                return
+                ;;
+        esac
+    fi
+    "$SH_DIR/src/init.sh" quick-install --no-restart
+}
+
 usage() {
     cat <<EOF
 Mundo Proxy 安装脚本
 
 用法:
   ./install.sh             安装并生成配置
+  ./install.sh onekey      一键安装并输出 URI
   ./install.sh --deps      安装依赖
   ./install.sh --uninstall 卸载
   ./install.sh --help      帮助
 
 要求:
   install.sh 同目录需要有 mundoproxy 文件。
+
+首次安装:
+  没有配置或没有节点时，按回车自动安装并输出 URI；输入 n 进入手动配置。
 EOF
 }
 
 main() {
+    local onekey_mode=0
     case "${1:-}" in
         -h|--help|help)
             usage
             exit 0
+            ;;
+        onekey|quick|quick-install|first-run)
+            onekey_mode=1
             ;;
         --deps|deps)
             require_root
@@ -304,16 +334,15 @@ main() {
     install_dependencies
     install_files "$source_dir" "$core_source"
 
-    if [ "$update_mode" -eq 1 ]; then
+    local configured_new=0
+    if [ "$onekey_mode" -eq 1 ]; then
+        "$SH_DIR/src/init.sh" quick-install --reset --no-restart
+        configured_new=1
+    elif [ "$update_mode" -eq 1 ] && [ -s "$CONFIG_FILE" ] && nodes_exist; then
         warn "更新模式保留配置文件: $CONFIG_FILE"
-    elif [ ! -s "$CONFIG_FILE" ]; then
-        "$SH_DIR/src/init.sh" config --no-restart
-        if [ -t 0 ]; then
-            read -r -p "是否现在启用 Brutal? [y/N]: " brutal_answer
-            case "$brutal_answer" in
-                y|Y|yes|YES) "$SH_DIR/src/init.sh" brutal ;;
-            esac
-        fi
+    elif [ ! -s "$CONFIG_FILE" ] || ! nodes_exist; then
+        first_run_config
+        configured_new=1
     else
         warn "已存在配置文件: $CONFIG_FILE"
         read -r -p "是否重新生成配置? [y/N]: " answer
@@ -323,6 +352,7 @@ main() {
     fi
 
     if [ "$update_mode" -eq 1 ]; then
+        [ "$configured_new" -eq 1 ] && was_running=1
         enable_service "$was_running"
         if [ "$was_running" -eq 1 ]; then
             ok "更新完成，服务已重新启动。"
@@ -333,8 +363,10 @@ main() {
         enable_service 1
         ok "安装完成。"
     fi
-    say ""
-    "$SH_DIR/src/init.sh" info
+    if [ "$onekey_mode" -eq 0 ] && [ "$configured_new" -eq 0 ]; then
+        say ""
+        "$SH_DIR/src/init.sh" info
+    fi
 }
 
 main "$@"

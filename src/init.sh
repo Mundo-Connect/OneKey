@@ -34,7 +34,6 @@ URI_DIR="$APP_DIR/uris"
 NGINX_CONF_FILE="/etc/nginx/conf.d/mundoproxy.conf"
 BRUTAL_PROFILE_FILE="$APP_DIR/brutal.env"
 BRUTAL_DEFAULT_MBPS=1000
-TCP_BRUTAL_URL="${TCP_BRUTAL_URL:-https://tcp.hy2.sh/}"
 TCP_BRUTAL_REPO="${TCP_BRUTAL_REPO:-https://github.com/apernet/tcp-brutal.git}"
 TCP_BRUTAL_SRC_DIR="${TCP_BRUTAL_SRC_DIR:-/usr/local/src/tcp-brutal}"
 MUNDO_BRUTAL_REPO="${MUNDO_BRUTAL_REPO:-https://github.com/Mundo-Connect/Mundo-Brutal.git}"
@@ -220,12 +219,13 @@ update_git_source() {
 install_module_from_source() {
     local dir="$1"
     local expected="${2:-}"
+    local cc="${BRUTAL_CC:-clang}"
     local module module_name target_dir
     make -C "$dir" clean >/dev/null 2>&1 || true
-    make -C "$dir" || return 1
+    make -C "$dir" CC="$cc" HOSTCC="$cc" || return 1
     module="$(find_kernel_module "$dir" "$expected")"
     [ -n "$module" ] || return 1
-    make -C "$dir" install || {
+    make -C "$dir" CC="$cc" HOSTCC="$cc" install || {
         target_dir="/lib/modules/$(uname -r)/extra"
         mkdir -p "$target_dir"
         install -m 644 "$module" "$target_dir/$(basename "$module")"
@@ -241,6 +241,28 @@ install_module_from_source() {
     load_kernel_module "$module_name" "$module"
 }
 
+install_brutal_build_deps() {
+    local manager="$1"
+    case "$manager" in
+        apk)
+            install_alpine_build_deps
+            ;;
+        apt)
+            apt-get update -y
+            DEBIAN_FRONTEND=noninteractive apt-get install -y git make clang kmod
+            ;;
+        dnf)
+            dnf install -y git make clang kmod
+            ;;
+        yum)
+            yum install -y git make clang kmod
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
 install_mundo_brutal() {
     local manager
     manager="$(detect_pkg_manager)"
@@ -248,17 +270,11 @@ install_mundo_brutal() {
         install_alpine_build_deps || return 1
     else
         ensure_kernel_headers || return 1
-        command -v git >/dev/null 2>&1 || case "$manager" in
-            apt) apt-get update -y && DEBIAN_FRONTEND=noninteractive apt-get install -y git ;;
-            dnf) dnf install -y git ;;
-            yum) yum install -y git ;;
-        esac
-        command -v make >/dev/null 2>&1 || case "$manager" in
-            apt) DEBIAN_FRONTEND=noninteractive apt-get install -y make gcc ;;
-            dnf) dnf install -y make gcc ;;
-            yum) yum install -y make gcc ;;
-        esac
+        if ! command -v git >/dev/null 2>&1 || ! command -v make >/dev/null 2>&1 || ! command -v clang >/dev/null 2>&1 || ! command -v modprobe >/dev/null 2>&1; then
+            install_brutal_build_deps "$manager" || return 1
+        fi
     fi
+    command -v clang >/dev/null 2>&1 || return 1
     update_git_source "$MUNDO_BRUTAL_REPO" "$MUNDO_BRUTAL_SRC_DIR" &&
     install_module_from_source "$MUNDO_BRUTAL_SRC_DIR" mundo
 }
@@ -267,19 +283,16 @@ install_tcp_brutal() {
     local manager
     manager="$(detect_pkg_manager)"
     if [ "$manager" = "apk" ]; then
-        install_alpine_build_deps &&
-        update_git_source "$TCP_BRUTAL_REPO" "$TCP_BRUTAL_SRC_DIR" &&
-        install_module_from_source "$TCP_BRUTAL_SRC_DIR" brutal
-        return $?
+        install_alpine_build_deps || return 1
+    else
+        ensure_kernel_headers || return 1
+        if ! command -v git >/dev/null 2>&1 || ! command -v make >/dev/null 2>&1 || ! command -v clang >/dev/null 2>&1 || ! command -v modprobe >/dev/null 2>&1; then
+            install_brutal_build_deps "$manager" || return 1
+        fi
     fi
-    ensure_kernel_headers || return 1
-    command -v curl >/dev/null 2>&1 || case "$manager" in
-        apt) apt-get update -y && DEBIAN_FRONTEND=noninteractive apt-get install -y curl ;;
-        dnf) dnf install -y curl ;;
-        yum) yum install -y curl ;;
-    esac
-    bash <(curl -fsSL "$TCP_BRUTAL_URL") || return 1
-    load_kernel_module brutal
+    command -v clang >/dev/null 2>&1 || return 1
+    update_git_source "$TCP_BRUTAL_REPO" "$TCP_BRUTAL_SRC_DIR" &&
+    install_module_from_source "$TCP_BRUTAL_SRC_DIR" brutal
 }
 
 write_brutal_profile() {
@@ -898,6 +911,50 @@ default_port_for_transport() {
     esac
 }
 
+route_source_ip() {
+    local family="$1"
+    local target="$2"
+    command -v ip >/dev/null 2>&1 || return 1
+    ip "$family" route get "$target" 2>/dev/null | awk '{
+        for (i = 1; i <= NF; i++) {
+            if ($i == "src") {
+                print $(i + 1)
+                exit
+            }
+        }
+    }'
+}
+
+global_iface_ip() {
+    local family="$1"
+    command -v ip >/dev/null 2>&1 || return 1
+    ip -o "$family" addr show scope global up 2>/dev/null | awk '{
+        split($4, a, "/")
+        if (a[1] != "") {
+            print a[1]
+            exit
+        }
+    }'
+}
+
+detect_server_ip() {
+    local ip_value
+    ip_value="$(route_source_ip -4 1.1.1.1)"
+    [ -n "$ip_value" ] || ip_value="$(global_iface_ip -4)"
+    if [ -n "$ip_value" ]; then
+        printf "%s" "$ip_value"
+        return 0
+    fi
+    ip_value="$(route_source_ip -6 2606:4700:4700::1111)"
+    [ -n "$ip_value" ] || ip_value="$(global_iface_ip -6)"
+    [ -n "$ip_value" ] || err "未检测到可用的当前网卡 IPv4/IPv6 地址，请先配置网络。"
+    printf "%s" "$ip_value"
+}
+
+one_click_defaults_notice() {
+    say "按回车会自动安装并输出可直接使用的 URI；输入 n 可手动配置。"
+}
+
 choose_protocol_transport() {
     say "输入协议+传输（回车使用 mx+mundordp）:"
     say "协议:"
@@ -951,6 +1008,7 @@ ensure_dirs() {
 
 generate_self_signed_cert() {
     local host="$1"
+    local quiet="${2:-0}"
     local cn
     local san=""
 
@@ -958,10 +1016,10 @@ generate_self_signed_cert() {
     if is_domain_name "$host"; then
         cn="$host"
         san="subjectAltName=DNS:$host"
-        warn "将生成自签名证书: $host"
+        [ "$quiet" = "1" ] || warn "将生成自签名证书: $host"
     else
         cn="$(random_desktop_name)"
-        warn "将生成自签名证书: $cn"
+        [ "$quiet" = "1" ] || warn "将生成自签名证书: $cn"
     fi
 
     rm -f "$CERT_FILE" "$KEY_FILE"
@@ -2100,6 +2158,72 @@ configure() {
     fi
 }
 
+clear_runtime_settings() {
+    rm -f "$CONFIG_FILE" "$PROFILE_FILE" "$CLIENT_URI_FILE" "$CLIENT_URI_ECH_FILE" "$BRUTAL_PROFILE_FILE"
+    rm -rf "$NODE_DIR" "$URI_DIR" "$CERT_DIR" "$MUNDO_CA_DIR"
+    ensure_dirs
+    write_brutal_profile 0 "$BRUTAL_DEFAULT_MBPS"
+    remove_nginx_config
+}
+
+quick_install_defaults() {
+    require_root
+
+    local no_restart=0
+    local reset_first=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --no-restart) no_restart=1 ;;
+            --reset) reset_first=1 ;;
+        esac
+        shift
+    done
+
+    [ "$reset_first" -eq 1 ] && stop_service_quiet
+    clear_runtime_settings
+
+    local protocol="mx"
+    local transport="mundordp"
+    local external_port="3389"
+    local core_port="3389"
+    local token
+    local host
+    local client_host
+    local path="/"
+    local username="Administrator"
+    local reverse_proxy=0
+    local cdn_enabled=0
+    local ca_enabled=0
+    local listen_addr="0.0.0.0"
+    local node_id node_uri_file node_ech_uri_file
+
+    token="$(random_uuid)"
+    host="$(detect_server_ip)"
+    client_host="$host"
+    [[ "$host" == *:* ]] && listen_addr="::"
+    CERT_FILE="$CERT_DIR/server.crt"
+    KEY_FILE="$CERT_DIR/server.key"
+    generate_self_signed_cert "$host" 1
+
+    node_id="$(sanitize_node_id "$protocol-$transport-$external_port")"
+    node_uri_file="$(node_uri_path "$node_id")"
+    node_ech_uri_file="$(node_ech_uri_path "$node_id")"
+
+    write_node_profile "$node_id" "$protocol" "$transport" "$external_port" "$core_port" "$token" "$host" "$client_host" "$path" "$username" "$reverse_proxy" "$cdn_enabled" "$ca_enabled" "" "" "" "" "$listen_addr" "$CERT_FILE" "$KEY_FILE" "$node_uri_file" "$node_ech_uri_file"
+    write_client_uris_to_files "$node_uri_file" "$node_ech_uri_file" "$protocol" "$transport" "$external_port" "$token" "$client_host" "$host" "$path" "$username" "$reverse_proxy" ""
+    write_config_from_nodes
+    write_profile "$protocol" "$transport" "$core_port" "$token" "$host" "$client_host" "$path" "$username" "off" "$reverse_proxy" "$external_port" "$core_port" "$cdn_enabled" "$ca_enabled" "" "" "" ""
+    write_client_uris "$protocol" "$transport" "$external_port" "$token" "$client_host" "$host" "$path" "$username" "$reverse_proxy" ""
+
+    ok "安装完成，URI 如下："
+    cat "$node_uri_file"
+
+    if [ "$no_restart" -eq 0 ]; then
+        start_service_quiet
+        ok "服务已启动。"
+    fi
+}
+
 start_service() {
     require_root
     if systemd_available; then
@@ -2320,7 +2444,7 @@ uninstall_mundo_proxy() {
         rc-service mundoproxy stop >/dev/null 2>&1 || true
         rc-update del mundoproxy default >/dev/null 2>&1 || true
     fi
-    rm -f "$SERVICE_FILE" "$OPENRC_SERVICE_FILE" "$COMMAND_BIN" "$CORE_BIN" "$CORE_BACKUP_BIN"
+    rm -f "$SERVICE_FILE" "$OPENRC_SERVICE_FILE" "$COMMAND_BIN" "$CORE_BIN" "$CORE_BACKUP_BIN" "$BIN_DIR/install.sh" "$SH_DIR/src/init.sh"
     remove_nginx_config
     rm -rf "$APP_DIR" "$LOG_DIR"
     if systemd_available; then
@@ -2357,6 +2481,8 @@ Mundo Proxy
   mp add-node  新增入站节点
   mp del-node  删除入站
   mp brutal    配置 TCP Brutal / Mundo X Brutal
+  mp quick     一键生成默认 mx+mundordp 配置
+  mp reset     恢复初始化状态并停止服务
   mp restart   重启服务（使配置生效）
   mp status    状态
   mp autostart 开关开机启动
@@ -2391,12 +2517,46 @@ stop_service_quiet() {
     fi
 }
 
+start_service_quiet() {
+    if systemd_available && systemctl list-unit-files mundoproxy.service >/dev/null 2>&1; then
+        systemctl start mundoproxy >/dev/null 2>&1 || true
+    elif openrc_available && [ -f "$OPENRC_SERVICE_FILE" ]; then
+        rc-service mundoproxy start >/dev/null 2>&1 || true
+    fi
+}
+
 restart_service_quiet() {
     if systemd_available && systemctl list-unit-files mundoproxy.service >/dev/null 2>&1; then
         systemctl restart mundoproxy >/dev/null 2>&1 || true
     elif openrc_available && [ -f "$OPENRC_SERVICE_FILE" ]; then
         rc-service mundoproxy restart >/dev/null 2>&1 || true
     fi
+}
+
+first_run_guide() {
+    say ""
+    say "${yellow}当前没有任何入站节点。${none}"
+    one_click_defaults_notice
+    if [ -t 0 ]; then
+        local answer
+        read -r -p "是否自动安装？[Y/n]: " answer
+        case "$answer" in
+            n|N|no|NO)
+                configure
+                return
+                ;;
+        esac
+    fi
+    quick_install_defaults
+}
+
+reset_defaults() {
+    require_root
+    warn "恢复初始化状态会删除全部节点、配置、URI 和证书，并停止服务。"
+    yes_no_default_no "确认恢复初始化状态（回车默认取消）" || return 0
+    stop_service_quiet
+    clear_runtime_settings
+    ok "已恢复初始化状态，服务已停止。"
 }
 
 delete_node() {
@@ -2462,9 +2622,7 @@ menu() {
         migrate_profile_to_nodes
         collect_node_files
         if [ "${#NODE_FILES[@]}" -eq 0 ]; then
-            say ""
-            say "${yellow}当前没有任何入站节点，请先创建第一个。${none}"
-            configure
+            first_run_guide
             continue
         fi
         show_info
@@ -2479,7 +2637,8 @@ menu() {
         say "  7) 开机启动 $(autostart_status_label)"
         say "  8) Brutal 配置"
         say "  9) 错误日志"
-        say " 10) 卸载"
+        say " 10) 恢复初始化"
+        say " 11) 卸载"
         say "  0) 退出"
         local choice
         read -r -p "请选择 [1]: " choice
@@ -2499,7 +2658,8 @@ menu() {
                 ;;
             8) configure_brutal ;;
             9) show_log "$ERROR_LOG" ;;
-            10) uninstall_mundo_proxy ;;
+            10) reset_defaults ;;
+            11) uninstall_mundo_proxy ;;
             0) exit 0 ;;
             *) warn "无效选择。" ;;
         esac
@@ -2533,6 +2693,13 @@ main() {
             ;;
         brutal)
             configure_brutal
+            ;;
+        quick-install|quick|first-run)
+            shift
+            quick_install_defaults --reset "$@"
+            ;;
+        reset-default|reset|defaults|restore-default)
+            reset_defaults
             ;;
         start)
             start_service
