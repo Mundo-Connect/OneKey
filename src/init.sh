@@ -911,6 +911,17 @@ default_port_for_transport() {
     esac
 }
 
+trace_public_ip() {
+    local family="$1"
+    local trace=""
+    if command -v wget >/dev/null 2>&1; then
+        trace="$(wget "$family" -qO- -T 5 https://one.one.one.one/cdn-cgi/trace 2>/dev/null || true)"
+    elif command -v curl >/dev/null 2>&1; then
+        trace="$(curl "$family" -fsSL --connect-timeout 3 --max-time 5 https://one.one.one.one/cdn-cgi/trace 2>/dev/null || true)"
+    fi
+    printf "%s" "$trace" | awk -F= '$1 == "ip" { gsub(/\r/, "", $2); print $2; exit }'
+}
+
 route_source_ip() {
     local family="$1"
     local target="$2"
@@ -929,6 +940,9 @@ global_iface_ip() {
     local family="$1"
     command -v ip >/dev/null 2>&1 || return 1
     ip -o "$family" addr show scope global up 2>/dev/null | awk '{
+        if ($0 ~ / deprecated / || $0 ~ / tentative /) {
+            next
+        }
         split($4, a, "/")
         if (a[1] != "") {
             print a[1]
@@ -937,16 +951,71 @@ global_iface_ip() {
     }'
 }
 
+hostname_iface_ip() {
+    local family="$1"
+    command -v hostname >/dev/null 2>&1 || return 1
+    hostname -I 2>/dev/null | awk -v family="$family" '{
+        for (i = 1; i <= NF; i++) {
+            if (family == "-4" && $i ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ && $i !~ /^127\./) {
+                print $i
+                exit
+            }
+            if (family == "-6" && index($i, ":") > 0 && $i != "::1" && $i !~ /^fe80:/) {
+                print $i
+                exit
+            }
+        }
+    }'
+}
+
+ifconfig_iface_ip() {
+    local family="$1"
+    command -v ifconfig >/dev/null 2>&1 || return 1
+    ifconfig 2>/dev/null | awk -v family="$family" '
+        family == "-4" && $1 == "inet" {
+            ip = $2
+            sub(/^addr:/, "", ip)
+            if (ip !~ /^127\./) {
+                print ip
+                exit
+            }
+        }
+        family == "-6" && $1 == "inet6" {
+            ip = $2
+            if (ip == "addr:") {
+                ip = $3
+            }
+            sub(/^addr:/, "", ip)
+            sub(/\/.*/, "", ip)
+            if (ip != "::1" && ip !~ /^fe80:/) {
+                print ip
+                exit
+            }
+        }
+    '
+}
+
+local_iface_ip() {
+    local family="$1"
+    local target="$2"
+    local ip_value
+    ip_value="$(route_source_ip "$family" "$target")"
+    [ -n "$ip_value" ] || ip_value="$(global_iface_ip "$family")"
+    [ -n "$ip_value" ] || ip_value="$(hostname_iface_ip "$family")"
+    [ -n "$ip_value" ] || ip_value="$(ifconfig_iface_ip "$family")"
+    printf "%s" "$ip_value"
+}
+
 detect_server_ip() {
     local ip_value
-    ip_value="$(route_source_ip -4 1.1.1.1)"
-    [ -n "$ip_value" ] || ip_value="$(global_iface_ip -4)"
+    ip_value="$(trace_public_ip -4)"
+    [ -n "$ip_value" ] || ip_value="$(local_iface_ip -4 1.1.1.1)"
     if [ -n "$ip_value" ]; then
         printf "%s" "$ip_value"
         return 0
     fi
-    ip_value="$(route_source_ip -6 2606:4700:4700::1111)"
-    [ -n "$ip_value" ] || ip_value="$(global_iface_ip -6)"
+    ip_value="$(trace_public_ip -6)"
+    [ -n "$ip_value" ] || ip_value="$(local_iface_ip -6 2606:4700:4700::1111)"
     [ -n "$ip_value" ] || err "未检测到可用的当前网卡 IPv4/IPv6 地址，请先配置网络。"
     printf "%s" "$ip_value"
 }

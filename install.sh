@@ -140,7 +140,7 @@ install_dependencies() {
     esac
 
     command -v openssl >/dev/null 2>&1 || err "openssl 安装失败。"
-    command -v ip >/dev/null 2>&1 || err "iproute 安装失败。"
+    command -v ip >/dev/null 2>&1 || warn "iproute 未安装成功，将继续使用公网探测和本机网卡地址。"
 }
 
 write_service() {
