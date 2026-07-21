@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 APP_NAME="Mundo Proxy"
 APP_DIR="/etc/mundoproxy"
@@ -23,6 +23,7 @@ ACCESS_LOG="$LOG_DIR/access.log"
 ERROR_LOG="$LOG_DIR/error.log"
 SERVICE_FILE="/etc/systemd/system/mundoproxy.service"
 OPENRC_SERVICE_FILE="/etc/init.d/mundoproxy"
+FREEBSD_SERVICE_FILE="/usr/local/etc/rc.d/mundoproxy"
 COMMAND_BIN="/usr/local/bin/mp"
 CORE_BIN="/usr/local/bin/mundoproxy"
 CORE_BACKUP_BIN="$BIN_DIR/mundoproxy"
@@ -63,8 +64,18 @@ openrc_available() {
     command -v rc-service >/dev/null 2>&1 && command -v rc-update >/dev/null 2>&1
 }
 
+freebsd_available() {
+    [ "$(uname -s)" = "FreeBSD" ] && command -v service >/dev/null 2>&1
+}
+
+if freebsd_available; then
+    NGINX_CONF_FILE="/usr/local/etc/nginx/conf.d/mundoproxy.conf"
+fi
+
 detect_pkg_manager() {
-    if command -v apt-get >/dev/null 2>&1; then
+    if command -v pkg >/dev/null 2>&1 && freebsd_available; then
+        echo pkg
+    elif command -v apt-get >/dev/null 2>&1; then
         echo apt
     elif command -v dnf >/dev/null 2>&1; then
         echo dnf
@@ -84,6 +95,9 @@ install_nginx() {
     [ -n "$manager" ] || err "无法识别包管理器，请手动安装 nginx openssl。"
     warn "正在安装 Nginx 和 OpenSSL。"
     case "$manager" in
+        pkg)
+            pkg install -y nginx openssl ca_root_nss
+            ;;
         apt)
             apt-get update -y
             DEBIAN_FRONTEND=noninteractive apt-get install -y nginx openssl ca-certificates
@@ -108,6 +122,9 @@ install_certbot() {
     [ -n "$manager" ] || return 1
     warn "安装 certbot。"
     case "$manager" in
+        pkg)
+            pkg install -y py311-certbot
+            ;;
         apt)
             apt-get update -y
             DEBIAN_FRONTEND=noninteractive apt-get install -y certbot
@@ -316,6 +333,7 @@ load_brutal_profile() {
 }
 
 core_brutal_args() {
+    freebsd_available && return 0
     load_brutal_profile
     [ "${BRUTAL_ENABLED:-0}" = "1" ] || return 0
     printf " -brutal %s" "${BRUTAL_MBPS:-$BRUTAL_DEFAULT_MBPS}"
@@ -323,6 +341,11 @@ core_brutal_args() {
 
 configure_brutal() {
     require_root
+    if freebsd_available; then
+        write_brutal_profile 0 "$BRUTAL_DEFAULT_MBPS"
+        warn "FreeBSD 不使用 Linux Brutal 内核模块。"
+        return 0
+    fi
     load_brutal_profile
     say "${blue}Brutal 配置${none}"
     if [ "${BRUTAL_ENABLED:-0}" = "1" ]; then
@@ -1213,9 +1236,7 @@ EOF
 $(render_tls_settings "$host" "$cert_file" "$key_file"),
     "mundosqlSettings": {
       "username": "$username",
-      "password": "$password",
-      "database": "app",
-      "connections": 1$(json_mundo_ca_field "$ca_cert" 6)
+      "password": "$password"$(json_mundo_ca_field "$ca_cert" 6)
     }
   }
 EOF
@@ -1318,8 +1339,6 @@ write_config() {
     cat > "$CONFIG_FILE" <<EOF
 {
   "log": {
-    "access": "$ACCESS_LOG",
-    "error": "$ERROR_LOG",
     "loglevel": "warning"
   },
   "inbounds": [
@@ -1766,8 +1785,6 @@ write_config_from_nodes() {
         cat <<EOF
 {
   "log": {
-    "access": "$ACCESS_LOG",
-    "error": "$ERROR_LOG",
     "loglevel": "warning"
   },
   "inbounds": [
@@ -1969,7 +1986,10 @@ EOF
     } > "$NGINX_CONF_FILE"
 
     nginx -t || err "Nginx 配置检查失败。"
-    if systemd_available; then
+    if freebsd_available; then
+        sysrc nginx_enable=YES >/dev/null
+        service nginx restart
+    elif systemd_available; then
         systemctl enable nginx >/dev/null 2>&1 || true
         systemctl restart nginx
     else
@@ -1982,7 +2002,9 @@ remove_nginx_config() {
     rm -f "$NGINX_CONF_FILE"
     if command -v nginx >/dev/null 2>&1; then
         nginx -t >/dev/null 2>&1 && {
-            if systemd_available; then
+            if freebsd_available; then
+                service nginx reload >/dev/null 2>&1 || true
+            elif systemd_available; then
                 systemctl reload nginx >/dev/null 2>&1 || true
             else
                 nginx -s reload >/dev/null 2>&1 || true
@@ -1995,6 +2017,10 @@ port_in_use() {
     local port="$1"
     if command -v ss >/dev/null 2>&1; then
         ss -H -ltn 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:)$port$"
+        return $?
+    fi
+    if command -v sockstat >/dev/null 2>&1; then
+        sockstat -46l 2>/dev/null | awk '{print $6}' | grep -Eq "(^|:)$port$"
         return $?
     fi
     if command -v netstat >/dev/null 2>&1; then
@@ -2012,6 +2038,10 @@ port_owner_hint() {
     local port="$1"
     if command -v ss >/dev/null 2>&1; then
         ss -H -ltnp 2>/dev/null | awk -v p=":$port" '$4 ~ p "$" {print; exit}'
+        return 0
+    fi
+    if command -v sockstat >/dev/null 2>&1; then
+        sockstat -46l 2>/dev/null | awk -v p=":$port" '$6 ~ p "$" {print; exit}'
         return 0
     fi
     if command -v netstat >/dev/null 2>&1; then
@@ -2218,7 +2248,10 @@ configure() {
     say "普通 URI: $(cat "$node_uri_file")"
     [ -f "$node_ech_uri_file" ] && say "ECH URI: $(cat "$node_ech_uri_file")"
 
-    if [ "$no_restart" -eq 0 ] && systemd_available && systemctl list-unit-files mundoproxy.service >/dev/null 2>&1; then
+    if [ "$no_restart" -eq 0 ] && freebsd_available && [ -x "$FREEBSD_SERVICE_FILE" ]; then
+        service mundoproxy restart
+        ok "服务已重启。"
+    elif [ "$no_restart" -eq 0 ] && systemd_available && systemctl list-unit-files mundoproxy.service >/dev/null 2>&1; then
         systemctl restart mundoproxy
         ok "服务已重启。"
     elif [ "$no_restart" -eq 0 ] && openrc_available && [ -f "$OPENRC_SERVICE_FILE" ]; then
@@ -2295,38 +2328,48 @@ quick_install_defaults() {
 
 start_service() {
     require_root
-    if systemd_available; then
+    if freebsd_available; then
+        service mundoproxy start
+    elif systemd_available; then
         systemctl start mundoproxy
     elif openrc_available; then
         rc-service mundoproxy start
     else
-        err "未检测到 systemd 或 OpenRC。"
+        err "未检测到 FreeBSD rc.d、systemd 或 OpenRC。"
     fi
 }
 
 stop_service() {
     require_root
-    if systemd_available; then
+    if freebsd_available; then
+        service mundoproxy stop
+    elif systemd_available; then
         systemctl stop mundoproxy
     elif openrc_available; then
         rc-service mundoproxy stop
     else
-        err "未检测到 systemd 或 OpenRC。"
+        err "未检测到 FreeBSD rc.d、systemd 或 OpenRC。"
     fi
 }
 
 restart_service() {
     require_root
-    if systemd_available; then
+    if freebsd_available; then
+        service mundoproxy restart
+    elif systemd_available; then
         systemctl restart mundoproxy
     elif openrc_available; then
         rc-service mundoproxy restart
     else
-        err "未检测到 systemd 或 OpenRC。"
+        err "未检测到 FreeBSD rc.d、systemd 或 OpenRC。"
     fi
 }
 
 autostart_enabled() {
+    if freebsd_available; then
+        [ "$(sysrc -n mundoproxy_enable 2>/dev/null)" = "YES" ]
+        return $?
+    fi
     if systemd_available; then
         systemctl is-enabled mundoproxy >/dev/null 2>&1
         return $?
@@ -2348,32 +2391,39 @@ autostart_status_label() {
 
 enable_autostart() {
     require_root
-    if systemd_available; then
+    if freebsd_available; then
+        [ -f "$FREEBSD_SERVICE_FILE" ] || err "服务文件不存在: $FREEBSD_SERVICE_FILE"
+        sysrc mundoproxy_enable=YES >/dev/null
+    elif systemd_available; then
         [ -f "$SERVICE_FILE" ] || err "服务文件不存在: $SERVICE_FILE"
         systemctl enable mundoproxy >/dev/null
     elif openrc_available; then
         [ -f "$OPENRC_SERVICE_FILE" ] || err "服务文件不存在: $OPENRC_SERVICE_FILE"
         rc-update add mundoproxy default >/dev/null
     else
-        err "未检测到 systemd 或 OpenRC。"
+        err "未检测到 FreeBSD rc.d、systemd 或 OpenRC。"
     fi
     ok "开机启动已开启。"
 }
 
 disable_autostart() {
     require_root
-    if systemd_available; then
+    if freebsd_available; then
+        sysrc mundoproxy_enable=NO >/dev/null
+    elif systemd_available; then
         systemctl disable mundoproxy >/dev/null 2>&1 || true
     elif openrc_available; then
         rc-update del mundoproxy default >/dev/null 2>&1 || true
     else
-        err "未检测到 systemd 或 OpenRC。"
+        err "未检测到 FreeBSD rc.d、systemd 或 OpenRC。"
     fi
     ok "开机启动已关闭。"
 }
 
 status_service() {
-    if systemd_available && systemctl list-unit-files mundoproxy.service >/dev/null 2>&1; then
+    if freebsd_available && [ -x "$FREEBSD_SERVICE_FILE" ]; then
+        service mundoproxy status
+    elif systemd_available && systemctl list-unit-files mundoproxy.service >/dev/null 2>&1; then
         systemctl status mundoproxy --no-pager
     elif openrc_available && [ -f "$OPENRC_SERVICE_FILE" ]; then
         rc-service mundoproxy status
@@ -2505,7 +2555,10 @@ uninstall_mundo_proxy() {
         *) say "已取消。"; exit 0 ;;
     esac
 
-    if systemd_available; then
+    if freebsd_available; then
+        service mundoproxy stop >/dev/null 2>&1 || true
+        sysrc -x mundoproxy_enable >/dev/null 2>&1 || true
+    elif systemd_available; then
         systemctl stop mundoproxy >/dev/null 2>&1 || true
         systemctl disable mundoproxy >/dev/null 2>&1 || true
         systemctl reset-failed mundoproxy >/dev/null 2>&1 || true
@@ -2513,7 +2566,7 @@ uninstall_mundo_proxy() {
         rc-service mundoproxy stop >/dev/null 2>&1 || true
         rc-update del mundoproxy default >/dev/null 2>&1 || true
     fi
-    rm -f "$SERVICE_FILE" "$OPENRC_SERVICE_FILE" "$COMMAND_BIN" "$CORE_BIN" "$CORE_BACKUP_BIN" "$BIN_DIR/install.sh" "$SH_DIR/src/init.sh"
+    rm -f "$SERVICE_FILE" "$OPENRC_SERVICE_FILE" "$FREEBSD_SERVICE_FILE" "$COMMAND_BIN" "$CORE_BIN" "$CORE_BACKUP_BIN" "$BIN_DIR/install.sh" "$SH_DIR/src/init.sh"
     remove_nginx_config
     rm -rf "$APP_DIR" "$LOG_DIR"
     if systemd_available; then
@@ -2525,10 +2578,10 @@ uninstall_mundo_proxy() {
 run_core() {
     [ -x "$CORE_BIN" ] || err "内核不存在: $CORE_BIN"
     load_brutal_profile
-    if [ "${BRUTAL_ENABLED:-0}" = "1" ]; then
-        exec "$CORE_BIN" run -c "$CONFIG_FILE" -brutal "${BRUTAL_MBPS:-$BRUTAL_DEFAULT_MBPS}"
+    if ! freebsd_available && [ "${BRUTAL_ENABLED:-0}" = "1" ]; then
+        exec "$CORE_BIN" -c "$CONFIG_FILE" -brutal "${BRUTAL_MBPS:-$BRUTAL_DEFAULT_MBPS}"
     fi
-    exec "$CORE_BIN" run -c "$CONFIG_FILE"
+    exec "$CORE_BIN" -c "$CONFIG_FILE"
 }
 
 install_again() {
@@ -2579,7 +2632,9 @@ sync_primary_profile_from_first_node() {
 }
 
 stop_service_quiet() {
-    if systemd_available && systemctl list-unit-files mundoproxy.service >/dev/null 2>&1; then
+    if freebsd_available && [ -x "$FREEBSD_SERVICE_FILE" ]; then
+        service mundoproxy stop >/dev/null 2>&1 || true
+    elif systemd_available && systemctl list-unit-files mundoproxy.service >/dev/null 2>&1; then
         systemctl stop mundoproxy >/dev/null 2>&1 || true
     elif openrc_available && [ -f "$OPENRC_SERVICE_FILE" ]; then
         rc-service mundoproxy stop >/dev/null 2>&1 || true
@@ -2587,7 +2642,9 @@ stop_service_quiet() {
 }
 
 start_service_quiet() {
-    if systemd_available && systemctl list-unit-files mundoproxy.service >/dev/null 2>&1; then
+    if freebsd_available && [ -x "$FREEBSD_SERVICE_FILE" ]; then
+        service mundoproxy start >/dev/null 2>&1 || true
+    elif systemd_available && systemctl list-unit-files mundoproxy.service >/dev/null 2>&1; then
         systemctl start mundoproxy >/dev/null 2>&1 || true
     elif openrc_available && [ -f "$OPENRC_SERVICE_FILE" ]; then
         rc-service mundoproxy start >/dev/null 2>&1 || true
@@ -2595,7 +2652,9 @@ start_service_quiet() {
 }
 
 restart_service_quiet() {
-    if systemd_available && systemctl list-unit-files mundoproxy.service >/dev/null 2>&1; then
+    if freebsd_available && [ -x "$FREEBSD_SERVICE_FILE" ]; then
+        service mundoproxy restart >/dev/null 2>&1 || true
+    elif systemd_available && systemctl list-unit-files mundoproxy.service >/dev/null 2>&1; then
         systemctl restart mundoproxy >/dev/null 2>&1 || true
     elif openrc_available && [ -f "$OPENRC_SERVICE_FILE" ]; then
         rc-service mundoproxy restart >/dev/null 2>&1 || true

@@ -2,13 +2,20 @@
 
 Mundo Connect 专用安装脚本，项目主页：https://github.com/Mundo-Connect
 
-脚本源码使用 GPL v3 授权。这里不下载 release，安装时请把已编译好的 `mundoproxy` 和 `install.sh` 放在同一个目录。
+脚本源码使用 GPL v3 授权。这里不下载 release，安装时请把对应系统已编译好的 `mundoproxy` 和 `install.sh` 放在同一个目录。FreeBSD 14+/amd64 内核可在核心项目执行 `bash freebsdamd64.sh` 交叉编译。
 
 ## 使用
 
 ```bash
 chmod +x install.sh mundoproxy
 sudo ./install.sh
+```
+
+FreeBSD 首次使用先安装 Bash 和证书包：
+
+```bash
+pkg install -y bash openssl ca_root_nss
+bash install.sh
 ```
 
 安装后使用：
@@ -77,7 +84,7 @@ MundoCA 证书文件路径：
 
 `mc1`、`xhttp`、`ws` 支持 CDN。配置时可以选择填写 CDN 优选地址；启用后 URI 使用优选地址连接，SNI/Host 仍使用原域名。
 
-`mx+mundosql` 使用 MySQL 外观传输，默认端口 `3306`，强制 TLS。脚本会写入 `streamSettings.mundosqlSettings`，默认数据库用户名是 `mundouser`，密码使用配置时生成或填写的 token。
+`mx+mundosql` 使用 MySQL 外观传输，默认端口 `3306`，强制 TLS。用户名默认为 `mundouser`，密码使用节点 token。
 
 ## 认证方式
 
@@ -111,7 +118,7 @@ certbot 使用 standalone 模式，需要服务器 80 端口可用。申请失�
 
 ## 服务
 
-Debian/RHEL 使用 systemd，Alpine 使用 OpenRC。
+Debian/RHEL 使用 systemd，Alpine 使用 OpenRC，FreeBSD 使用 rc.d。
 
 安装后默认开启开机启动。可以在 `mp` 菜单里开启或关闭，也可以使用：
 
@@ -119,6 +126,17 @@ Debian/RHEL 使用 systemd，Alpine 使用 OpenRC。
 mp enable-autostart
 mp disable-autostart
 ```
+
+FreeBSD 也可以直接管理服务：
+
+```bash
+service mundoproxy start
+service mundoproxy stop
+service mundoproxy restart
+service mundoproxy status
+```
+
+Brutal 是 Linux 内核模块，FreeBSD 上保持禁用，不影响其他协议和传输。
 
 ## 多入站
 

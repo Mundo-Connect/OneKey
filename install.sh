@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 set -e
 
@@ -11,6 +11,7 @@ NODE_DIR="$APP_DIR/nodes"
 LOG_DIR="/var/log/mundoproxy"
 SERVICE_FILE="/etc/systemd/system/mundoproxy.service"
 OPENRC_SERVICE_FILE="/etc/init.d/mundoproxy"
+FREEBSD_SERVICE_FILE="/usr/local/etc/rc.d/mundoproxy"
 COMMAND_BIN="/usr/local/bin/mp"
 CORE_BIN="/usr/local/bin/mundoproxy"
 CORE_BACKUP_BIN="$BIN_DIR/mundoproxy"
@@ -61,37 +62,51 @@ openrc_available() {
     command -v rc-service >/dev/null 2>&1 && command -v rc-update >/dev/null 2>&1
 }
 
+freebsd_available() {
+    [ "$(uname -s)" = "FreeBSD" ] && command -v service >/dev/null 2>&1
+}
+
 service_installed() {
     [ -x "$CORE_BIN" ] ||
     [ -f "$SERVICE_FILE" ] ||
     [ -f "$OPENRC_SERVICE_FILE" ] ||
+    [ -f "$FREEBSD_SERVICE_FILE" ] ||
     [ -f "$CONFIG_FILE" ]
 }
 
 service_running() {
+    if freebsd_available && [ -x "$FREEBSD_SERVICE_FILE" ]; then
+        service mundoproxy onestatus >/dev/null 2>&1 && return 0
+    fi
     if systemd_available && systemctl list-unit-files mundoproxy.service >/dev/null 2>&1; then
         systemctl is-active --quiet mundoproxy && return 0
     fi
     if openrc_available && [ -f "$OPENRC_SERVICE_FILE" ]; then
         rc-service mundoproxy status >/dev/null 2>&1 && return 0
     fi
+    pgrep -f "$CORE_BIN -c $CONFIG_FILE" >/dev/null 2>&1 ||
     pgrep -f "$CORE_BIN run -c $CONFIG_FILE" >/dev/null 2>&1 ||
     pgrep -f "$COMMAND_BIN run" >/dev/null 2>&1
 }
 
 stop_service_if_installed() {
-    if systemd_available && systemctl list-unit-files mundoproxy.service >/dev/null 2>&1; then
+    if freebsd_available && [ -x "$FREEBSD_SERVICE_FILE" ]; then
+        service mundoproxy stop >/dev/null 2>&1 || true
+    elif systemd_available && systemctl list-unit-files mundoproxy.service >/dev/null 2>&1; then
         systemctl stop mundoproxy >/dev/null 2>&1 || true
     elif openrc_available && [ -f "$OPENRC_SERVICE_FILE" ]; then
         rc-service mundoproxy stop >/dev/null 2>&1 || true
     else
+        pkill -f "$CORE_BIN -c $CONFIG_FILE" >/dev/null 2>&1 || true
         pkill -f "$CORE_BIN run -c $CONFIG_FILE" >/dev/null 2>&1 || true
         pkill -f "$COMMAND_BIN run" >/dev/null 2>&1 || true
     fi
 }
 
 detect_pkg_manager() {
-    if command -v apt-get >/dev/null 2>&1; then
+    if command -v pkg >/dev/null 2>&1 && [ "$(uname -s)" = "FreeBSD" ]; then
+        echo pkg
+    elif command -v apt-get >/dev/null 2>&1; then
         echo apt
     elif command -v dnf >/dev/null 2>&1; then
         echo dnf
@@ -107,8 +122,12 @@ detect_pkg_manager() {
 install_dependencies() {
     local missing=""
     command -v openssl >/dev/null 2>&1 || missing="$missing openssl"
-    command -v ip >/dev/null 2>&1 || missing="$missing iproute"
-    if command -v update-ca-certificates >/dev/null 2>&1 || command -v trust >/dev/null 2>&1; then
+    if freebsd_available; then
+        command -v ifconfig >/dev/null 2>&1 || missing="$missing ifconfig"
+    else
+        command -v ip >/dev/null 2>&1 || missing="$missing iproute"
+    fi
+    if command -v update-ca-certificates >/dev/null 2>&1 || command -v trust >/dev/null 2>&1 || [ -r /etc/ssl/cert.pem ]; then
         :
     else
         missing="$missing ca-certificates"
@@ -120,10 +139,13 @@ install_dependencies() {
 
     local manager
     manager="$(detect_pkg_manager)"
-    [ -n "$manager" ] || err "无法识别包管理器，请手动安装: openssl ca-certificates iproute2/iproute"
+    [ -n "$manager" ] || err "无法识别包管理器，请手动安装: openssl ca-certificates"
 
     warn "安装依赖:$missing"
     case "$manager" in
+        pkg)
+            pkg install -y openssl ca_root_nss
+            ;;
         apt)
             apt-get update -y
             DEBIAN_FRONTEND=noninteractive apt-get install -y openssl ca-certificates iproute2
@@ -140,7 +162,9 @@ install_dependencies() {
     esac
 
     command -v openssl >/dev/null 2>&1 || err "openssl 安装失败。"
-    command -v ip >/dev/null 2>&1 || warn "iproute 未安装成功，将继续使用公网探测和本机网卡地址。"
+    if ! freebsd_available; then
+        command -v ip >/dev/null 2>&1 || warn "iproute 未安装成功，将继续使用公网探测和本机网卡地址。"
+    fi
 }
 
 write_service() {
@@ -183,6 +207,36 @@ EOF
     chmod +x "$OPENRC_SERVICE_FILE"
 }
 
+write_freebsd_service() {
+    mkdir -p "$(dirname "$FREEBSD_SERVICE_FILE")"
+    cat > "$FREEBSD_SERVICE_FILE" <<EOF
+#!/bin/sh
+# PROVIDE: mundoproxy
+# REQUIRE: NETWORKING
+# KEYWORD: shutdown
+
+. /etc/rc.subr
+
+name="mundoproxy"
+rcvar="mundoproxy_enable"
+load_rc_config "\$name"
+: \${mundoproxy_enable:="NO"}
+
+pidfile="/var/run/mundoproxy.pid"
+command="/usr/sbin/daemon"
+command_args="-f -P \${pidfile} -r -R 3 -o $LOG_DIR/service.log $COMMAND_BIN run"
+required_files="$COMMAND_BIN $CORE_BIN $CONFIG_FILE"
+start_precmd="mundoproxy_prestart"
+
+mundoproxy_prestart() {
+    ulimit -S -n "\$(ulimit -H -n)" 2>/dev/null || true
+}
+
+run_rc_command "\$1"
+EOF
+    chmod 555 "$FREEBSD_SERVICE_FILE"
+}
+
 install_files() {
     local source_dir="$1"
     local core_source="$2"
@@ -201,7 +255,7 @@ install_files() {
     fi
 
     cat > "$COMMAND_BIN" <<EOF
-#!/bin/bash
+#!/usr/bin/env bash
 exec "$SH_DIR/src/init.sh" "\$@"
 EOF
     chmod +x "$COMMAND_BIN"
@@ -209,7 +263,15 @@ EOF
 
 enable_service() {
     local should_start="${1:-1}"
-    if systemd_available; then
+    if freebsd_available; then
+        write_freebsd_service
+        sysrc mundoproxy_enable=YES >/dev/null
+        if [ "$should_start" -eq 1 ]; then
+            service mundoproxy start
+        else
+            service mundoproxy stop >/dev/null 2>&1 || true
+        fi
+    elif systemd_available; then
         write_service
         systemctl daemon-reload
         systemctl enable mundoproxy >/dev/null 2>&1 || true
@@ -227,7 +289,7 @@ enable_service() {
             rc-service mundoproxy stop >/dev/null 2>&1 || true
         fi
     else
-        warn "未检测到 systemd 或 OpenRC，请手动运行：mp run"
+        warn "未检测到 FreeBSD rc.d、systemd 或 OpenRC，请手动运行：mp run"
     fi
 }
 
@@ -289,7 +351,10 @@ main() {
             if [ -x "$SH_DIR/src/init.sh" ]; then
                 "$SH_DIR/src/init.sh" uninstall
             else
-                if command -v systemctl >/dev/null 2>&1; then
+                if freebsd_available; then
+                    service mundoproxy stop >/dev/null 2>&1 || true
+                    sysrc -x mundoproxy_enable >/dev/null 2>&1 || true
+                elif command -v systemctl >/dev/null 2>&1; then
                     systemctl stop mundoproxy >/dev/null 2>&1 || true
                     systemctl disable mundoproxy >/dev/null 2>&1 || true
                     systemctl reset-failed mundoproxy >/dev/null 2>&1 || true
@@ -297,7 +362,7 @@ main() {
                     rc-service mundoproxy stop >/dev/null 2>&1 || true
                     rc-update del mundoproxy default >/dev/null 2>&1 || true
                 fi
-                rm -f "$SERVICE_FILE" "$OPENRC_SERVICE_FILE" "$COMMAND_BIN" "$CORE_BIN" "$CORE_BACKUP_BIN"
+                rm -f "$SERVICE_FILE" "$OPENRC_SERVICE_FILE" "$FREEBSD_SERVICE_FILE" "$COMMAND_BIN" "$CORE_BIN" "$CORE_BACKUP_BIN"
                 rm -rf "$APP_DIR" "$LOG_DIR"
                 if command -v systemctl >/dev/null 2>&1; then
                     systemctl daemon-reload >/dev/null 2>&1 || true
