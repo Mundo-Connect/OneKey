@@ -80,9 +80,9 @@ MundoCA 证书文件路径：
 - `anytls+mc1`
 - `anytls+mundordp`
 
-`mx+mc1`、`mx+xhttp`、`mx+ws` 会同时生成普通 URI 和 ECH URI。
+只有 `mx+mc1`、`mx+ws` 会同时生成普通 URI 和 ECH URI；其他组合只生成普通 URI。每个 URI 文件以换行结尾，安装输出也将 URI 单独显示一行。
 
-`mc1`、`xhttp`、`ws` 支持 CDN。配置时可以选择填写 CDN 优选地址；启用后 URI 使用优选地址连接，SNI/Host 仍使用原域名。
+配置 `mc1` 或 `ws` 时，“优选或本机IP”默认填入一键安装使用的服务器 IP（优先公网探测，失败时取本机网卡 IP），也可以改填优选地址。`mundordp` 的 URI 连接地址直接使用同一检测到的 IP。证书域名、SNI 和 Host 仍使用填写的服务器域名。`xhttp` 保持可选 CDN 优选地址。
 
 `mx+mundosql` 使用 MySQL 外观传输，默认端口 `3306`，强制 TLS。用户名默认为 `mundouser`，密码使用节点 token。
 
@@ -102,7 +102,7 @@ Base64(privateKey[32] || publicKey[65])
 
 其中 `privateKey` 是 32 字节 SM2 私钥，`publicKey` 是 65 字节非压缩 SM2 公钥，首字节为 `0x04`。请在第一次输出时妥善保存该密钥对，并导入客户端。
 
-也可以选择手动填写客户端公钥。手动公钥必须是标准 Base64 编码的 65 字节非压缩 SM2 公钥，脚本会使用该公钥签发客户端证书；客户端私钥需要由客户端本地保存。
+也可以填写 Terminal UI“Signature manager”复制的客户端公钥。它是 Base64 编码的 65 字节非压缩 SM2 公钥（首字节 `0x04`，允许省略 Base64 填充）；脚本会使用该公钥签发客户端证书，客户端继续保留自己的私钥。脚本显式使用与核心相同的 SM2 签名标识 `1234567812345678`，确保签发的证书可被 MundoCA 校验。
 
 Root CA 证书会自动生成并保存在 `/etc/mundoproxy/mundo-ca/root-ca-certificate.b64`，客户端证书保存在 `/etc/mundoproxy/mundo-ca/client-certificate.b64`。私钥和密钥对文件会使用 `600` 权限保存。
 

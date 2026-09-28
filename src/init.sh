@@ -440,8 +440,10 @@ random_uuid() {
         cat /proc/sys/kernel/random/uuid
         return 0
     fi
-    local hex
+    local hex variant
     hex="$(random_hex 16)"
+    printf -v variant '%x' "$(((16#${hex:16:1} & 3) | 8))"
+    hex="${hex:0:12}4${hex:13:3}${variant}${hex:17}"
     printf "%s-%s-%s-%s-%s" "${hex:0:8}" "${hex:8:4}" "${hex:12:4}" "${hex:16:4}" "${hex:20:12}"
 }
 
@@ -602,7 +604,8 @@ ensure_mundo_ca_root() {
         -out "$MUNDO_CA_ROOT_CERT_FILE" \
         -subj "/CN=MundoCA Root" \
         -addext "basicConstraints=critical,CA:TRUE" \
-        -addext "keyUsage=critical,keyCertSign,digitalSignature" >/dev/null 2>&1 || err "MundoCA Root 证书生成失败。"
+        -addext "keyUsage=critical,keyCertSign,digitalSignature" \
+        -sigopt distid:1234567812345678 >/dev/null 2>&1 || err "MundoCA Root 证书生成失败。"
     chmod 600 "$MUNDO_CA_ROOT_KEY_FILE"
 }
 
@@ -617,14 +620,16 @@ issue_mundo_ca_client_certificate_from_key() {
     local csr_file="$MUNDO_CA_DIR/client.csr"
     local ext_file="$MUNDO_CA_DIR/client.ext"
     rm -f "$csr_file" "$ext_file" "$MUNDO_CA_CLIENT_CERT_FILE"
-    openssl req -new -key "$key_file" -out "$csr_file" -subj "/CN=MundoCA Client" >/dev/null 2>&1 || err "客户端证书请求生成失败。"
+    openssl req -new -key "$key_file" -out "$csr_file" -subj "/CN=MundoCA Client" -sigopt distid:1234567812345678 >/dev/null 2>&1 || err "客户端证书请求生成失败。"
     printf "basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\n" > "$ext_file"
     openssl x509 -req -in "$csr_file" \
+        -vfyopt distid:1234567812345678 \
         -CA "$MUNDO_CA_ROOT_CERT_FILE" \
         -CAkey "$MUNDO_CA_ROOT_KEY_FILE" \
         -CAcreateserial \
         -out "$MUNDO_CA_CLIENT_CERT_FILE" \
         -days 365 -sm3 \
+        -sigopt distid:1234567812345678 \
         -extfile "$ext_file" >/dev/null 2>&1 || err "客户端 SM2 证书签发失败。"
     rm -f "$csr_file" "$ext_file"
 }
@@ -646,15 +651,17 @@ prompt = no
 [ dn ]
 CN = MundoCA Client
 EOF
-    openssl req -new -config "$csr_conf" -key "$MUNDO_CA_ROOT_KEY_FILE" -subj "/CN=MundoCA Client" -out "$csr_file" >/dev/null 2>&1 || err "客户端证书请求生成失败。"
+    openssl req -new -config "$csr_conf" -key "$MUNDO_CA_ROOT_KEY_FILE" -subj "/CN=MundoCA Client" -out "$csr_file" -sigopt distid:1234567812345678 >/dev/null 2>&1 || err "客户端证书请求生成失败。"
     printf "basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\n" > "$ext_file"
     openssl x509 -req -in "$csr_file" \
+        -vfyopt distid:1234567812345678 \
         -force_pubkey "$pub_pem" \
         -CA "$MUNDO_CA_ROOT_CERT_FILE" \
         -CAkey "$MUNDO_CA_ROOT_KEY_FILE" \
         -CAcreateserial \
         -out "$MUNDO_CA_CLIENT_CERT_FILE" \
         -days 365 -sm3 \
+        -sigopt distid:1234567812345678 \
         -extfile "$ext_file" >/dev/null 2>&1 || err "客户端 SM2 证书签发失败。"
     rm -f "$pub_der" "$pub_pem" "$csr_conf" "$csr_file" "$ext_file"
 }
@@ -914,14 +921,7 @@ ech_capable_transport() {
     local transport="$2"
     [ "$protocol" = "mx" ] || return 1
     case "$transport" in
-        mc1|xhttp|websocket) return 0 ;;
-        *) return 1 ;;
-    esac
-}
-
-cdn_capable_transport() {
-    case "$1" in
-        mc1|xhttp|websocket) return 0 ;;
+        mc1|websocket) return 0 ;;
         *) return 1 ;;
     esac
 }
@@ -1085,12 +1085,27 @@ choose_cdn_address() {
     local default_host="$2"
     CLIENT_HOST="$default_host"
     CDN_ENABLED=0
-    if cdn_capable_transport "$transport" && yes_no_default_no "是否使用 CDN 优选地址（回车默认使用服务器地址直连）"; then
-        CLIENT_HOST="$(prompt_default "CDN 优选地址" "$default_host")"
-        CLIENT_HOST="$(sanitize_host "$CLIENT_HOST")"
-        [ -n "$CLIENT_HOST" ] || CLIENT_HOST="$default_host"
-        CDN_ENABLED=1
-    fi
+    case "$transport" in
+        mundordp)
+            CLIENT_HOST="$(detect_server_ip)"
+            ;;
+        mc1|websocket)
+            local server_ip
+            server_ip="$(detect_server_ip)"
+            CLIENT_HOST="$(prompt_default "优选或本机IP" "$server_ip")"
+            CLIENT_HOST="$(sanitize_host "$CLIENT_HOST")"
+            [ -n "$CLIENT_HOST" ] || CLIENT_HOST="$server_ip"
+            [ "$CLIENT_HOST" = "$server_ip" ] || CDN_ENABLED=1
+            ;;
+        xhttp)
+            if yes_no_default_no "是否使用 CDN 优选地址（回车默认使用服务器地址直连）"; then
+                CLIENT_HOST="$(prompt_default "CDN 优选地址" "$default_host")"
+                CLIENT_HOST="$(sanitize_host "$CLIENT_HOST")"
+                [ -n "$CLIENT_HOST" ] || CLIENT_HOST="$default_host"
+                CDN_ENABLED=1
+            fi
+            ;;
+    esac
 }
 
 ensure_dirs() {
@@ -1561,7 +1576,7 @@ build_client_uri() {
         query="$query&mundoCA=$(url_encode "$client_cert")"
     fi
 
-    printf "%s://%s@%s:%s?%s#%s" \
+    printf "%s://%s@%s:%s?%s#%s\n" \
         "$protocol" \
         "$(url_encode "$token")" \
         "$(uri_authority_host "$connect_host")" \
@@ -2245,8 +2260,12 @@ configure() {
     else
         say "$token_label: $token"
     fi
-    say "普通 URI: $(cat "$node_uri_file")"
-    [ -f "$node_ech_uri_file" ] && say "ECH URI: $(cat "$node_ech_uri_file")"
+    say "普通 URI:"
+    cat "$node_uri_file"
+    if [ -f "$node_ech_uri_file" ]; then
+        say "ECH URI:"
+        cat "$node_ech_uri_file"
+    fi
 
     if [ "$no_restart" -eq 0 ] && freebsd_available && [ -x "$FREEBSD_SERVICE_FILE" ]; then
         service mundoproxy restart
@@ -2485,7 +2504,7 @@ show_info() {
     [ -n "$transport" ] && say "传输: $(transport_display_name "$transport")"
     [ -n "$port" ] && say "端口: $port"
     [ -n "$host" ] && say "服务器: $host"
-    [ "$cdn_enabled" = "1" ] && [ -n "$client_host" ] && say "连接地址: $client_host"
+    [ -n "$client_host" ] && [ "$client_host" != "$host" ] && say "连接地址: $client_host"
     [ -n "$path_value" ] && [ "$transport" != "mundordp" ] && [ "$transport" != "mundosql" ] && say "路径: $path_value"
     [ "$transport" = "mundordp" ] && say "用户名: $rdp_username"
     [ "$transport" = "mundosql" ] && say "数据库用户名: $rdp_username"
@@ -2510,7 +2529,7 @@ show_info() {
         for file in "${NODE_FILES[@]}"; do
             source_node_profile "$file"
             say "[$index] $TAG  $PROTOCOL + $(transport_display_name "$TRANSPORT")  $PORT -> $LISTEN_ADDR:$CORE_PORT"
-            [ "$CDN_ENABLED" = "1" ] && say "    连接地址: $CLIENT_HOST"
+            [ -n "$CLIENT_HOST" ] && [ "$CLIENT_HOST" != "$HOST" ] && say "    连接地址: $CLIENT_HOST"
             if [ "$TRANSPORT" = "mundordp" ]; then
                 say "    用户名: $RDP_USERNAME"
             elif [ "$TRANSPORT" = "mundosql" ]; then
